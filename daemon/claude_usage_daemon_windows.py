@@ -59,6 +59,33 @@ API_BODY = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 
+# Grok CLI activity comes from PitCrew's local device endpoint, which owns the
+# ~/.grok ingestion + rate cards. Localhost only; entirely optional — a failure
+# never touches the Claude path (see fetch_grok_usage).
+PITCREW_USAGE_URL = os.environ.get("PITCREW_USAGE_URL", "http://127.0.0.1:3010/api/device/usage")
+
+
+async def fetch_grok_usage() -> dict:
+    """Grok CLI weekly/today activity ($, at API rates) from PitCrew, or {}.
+
+    Returns {"g": <week>, "gd": <today>} when PitCrew is reachable, else {} so
+    the device simply shows no Grok data that tick. Deliberately swallows every
+    error: this is a best-effort side channel, and the Claude subscription
+    display must never depend on PitCrew being up.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            resp = await http.get(PITCREW_USAGE_URL)
+        if resp.status_code != 200:
+            return {}
+        grok = resp.json().get("grok") or {}
+        if grok.get("weekUsd") is None:
+            return {}
+        return {"g": round(float(grok["weekUsd"])), "gd": round(float(grok.get("todayUsd", 0)))}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
+        log(f"Grok usage unavailable (PitCrew off?): {e}")
+        return {}
+
 
 def _build_file_logger() -> logging.Logger | None:
     """Create a rotating file logger for field diagnostics, or None.
@@ -246,6 +273,7 @@ async def poll_api(token: str) -> dict | None:
         }
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
+    payload.update(await fetch_grok_usage())  # adds "g"/"gd" iff PitCrew is up
     return payload
 
 
