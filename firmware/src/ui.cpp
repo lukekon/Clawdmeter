@@ -229,7 +229,13 @@ static lv_obj_t* idle_group;            // the "Zzz" idle screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
-static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
+// Usage counts as "live" within this window. Long by design: the daemon is
+// lifecycle-bound (a watcher runs it only while an AI CLI is active), so when it
+// stops the device should keep showing the last-synced numbers as a glanceable
+// snapshot rather than dropping to the idle screen. During active use the daemon
+// sends every ~60s, so this generous window never hides a genuinely stuck feed —
+// and the watcher respawns a dead daemon within ~10s anyway.
+static const uint32_t DATA_FRESH_MS = 43200000;  // 12h
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
