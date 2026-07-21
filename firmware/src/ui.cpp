@@ -573,10 +573,34 @@ void ui_init(void) {
     }
 }
 
+// The device shows two providers on the one usage screen, flipping between them
+// every PROVIDER_CYCLE_MS: Claude's native subscription % (the trick only
+// Anthropic's headers allow) and Grok's activity in $ at API rates (from
+// PitCrew, present only while it's reachable). The last payload is cached so a
+// cycle can re-render without waiting for the next 60s poll.
+#define PROVIDER_CYCLE_MS 6000
+static UsageData last_usage = {};
+static bool      have_usage = false;
+static int       provider_view = 0;         // 0 = Claude, 1 = Grok
+static uint32_t  provider_cycle_last = 0;
+
+static void render_claude(const UsageData* data);
+static void render_grok(const UsageData* data);
+
+// Grok view only when this payload actually carries Grok data; otherwise the
+// screen stays on Claude no matter where the cycle is.
+static void render_current(void) {
+    if (!have_usage) return;
+    if (provider_view == 1 && last_usage.grok_valid) render_grok(&last_usage);
+    else                                             render_claude(&last_usage);
+}
+
 void ui_update(const UsageData* data) {
     if (!data->valid) return;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
+    last_usage = *data;
+    have_usage = true;
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
@@ -588,7 +612,15 @@ void ui_update(const UsageData* data) {
         lv_label_set_text(lbl_title, "Usage");
     }
 
+    render_current();
+}
+
+static void render_claude(const UsageData* data) {
     int s_pct = (int)(data->session_pct + 0.5f);
+
+    // Coming back from the Grok view: restore the bars it hides.
+    lv_obj_clear_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
 
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
@@ -647,6 +679,7 @@ void ui_update(const UsageData* data) {
                  pace_hex, pace_text, data->reset_date);
         lv_label_set_text(lbl_weekly_reset, buf);
     } else {
+        lv_label_set_text(lbl_weekly_label, "Weekly");   // restore after a Grok render
         int w_pct = (int)(data->weekly_pct + 0.5f);
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", w_pct);
         lv_bar_set_value(bar_weekly, w_pct, LV_ANIM_ON);
@@ -654,6 +687,40 @@ void ui_update(const UsageData* data) {
         format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
         lv_label_set_text(lbl_weekly_reset, buf);
     }
+}
+
+// Format a $ figure compactly: whole dollars, or "<$1" so a small-but-nonzero
+// week never rounds to a flat "$0".
+static void fmt_usd(float v, char* buf, size_t n) {
+    if (v > 0.0f && v < 1.0f) snprintf(buf, n, "<$1");
+    else                       snprintf(buf, n, "$%d", (int)(v + 0.5f));
+}
+
+// Grok view — reuses the two panels but shows $ activity, not %. No bars: a
+// dollar figure has no natural 0-100 scale, and inventing a budget to fill one
+// is exactly the arbitrary number we're avoiding. The number carries it.
+static void render_grok(const UsageData* data) {
+    char buf[48];
+
+    // Session panel → "this week". Hide every %/enterprise overlay + the bar.
+    lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
+    lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lbl_session_label, "Grok week");
+    fmt_usd(data->grok_week_usd, buf, sizeof(buf));
+    lv_label_set_text(lbl_session_pct, buf);
+    lv_label_set_text(lbl_session_reset, "at API rates");
+    lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
+
+    // Weekly panel → "today".
+    if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lbl_weekly_label, "Grok today");
+    fmt_usd(data->grok_today_usd, buf, sizeof(buf));
+    lv_label_set_text(lbl_weekly_pct, buf);
+    lv_label_set_text(lbl_weekly_reset, "CLI + Slate");
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -685,6 +752,21 @@ void ui_tick_anim(void) {
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
 
     uint32_t now = lv_tick_get();
+
+    // Flip Claude ↔ Grok on the live panels every PROVIDER_CYCLE_MS. Only while
+    // showing live data and only when the last payload carried Grok — otherwise
+    // hold on Claude and keep the timer from drifting the moment Grok returns.
+    if (view_state == 2 && have_usage && last_usage.grok_valid) {
+        if (now - provider_cycle_last >= PROVIDER_CYCLE_MS) {
+            provider_cycle_last = now;
+            provider_view ^= 1;
+            render_current();
+        }
+    } else if (provider_view != 0) {
+        provider_view = 0;
+        provider_cycle_last = now;
+        render_current();
+    }
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.

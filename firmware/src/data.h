@@ -14,6 +14,11 @@ struct UsageData {
     char reset_date[12];     // formatted reset date e.g. "Jul 1" (Enterprise)
     long clock_epoch;        // local wall-clock epoch (s) from daemon; 0 = not provided
     int  clock_fmt;          // 12 or 24 (hour format from daemon); defaults to 24
+    // Grok activity from PitCrew (via the daemon). Dollar figures are estimated
+    // at API rates — an activity gauge, not a bill (SuperGrok is flat-rate).
+    bool grok_valid;         // "g" field present → the device can show a Grok view
+    float grok_week_usd;     // Grok CLI+Slate spend this week, $ at API rates
+    float grok_today_usd;    // ...today
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };

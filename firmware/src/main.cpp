@@ -119,6 +119,10 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    // Grok activity — only present when PitCrew is reachable; absent → no Grok view.
+    out->grok_valid = !doc["g"].isNull();
+    out->grok_week_usd = doc["g"] | 0.0f;
+    out->grok_today_usd = doc["gd"] | 0.0f;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
