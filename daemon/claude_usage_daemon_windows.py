@@ -59,31 +59,124 @@ API_BODY = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 
-# Grok CLI activity comes from PitCrew's local device endpoint, which owns the
-# ~/.grok ingestion + rate cards. Localhost only; entirely optional — a failure
-# never touches the Claude path (see fetch_grok_usage).
-PITCREW_USAGE_URL = os.environ.get("PITCREW_USAGE_URL", "http://127.0.0.1:3010/api/device/usage")
+# Grok CLI + Slate activity, computed HERE from the local logs so the device
+# needs only this daemon running — not PitCrew too. The math mirrors PitCrew's
+# AI Usage tab (same rate cards, same cached-token-subset handling) so the two
+# agree, but nothing has to be up for the device to show Grok.
+GROK_SESSIONS = Path.home() / ".grok" / "sessions"
+SLATE_MESSAGES = Path.home() / ".local" / "share" / "slate" / "storage" / "message"
+# $ per 1M tokens (input, output, cacheRead). xAI/Grok only — the device's Grok
+# view is xAI. Verified against docs.x.ai pricing; keep in sync with PitCrew's
+# lib/usage-rates.ts. Longest prefix first so grok-4.5 wins over any grok-4.
+XAI_RATES = [
+    ("grok-4.5", (2.0, 6.0, 0.5)),
+    ("grok-4.3", (1.25, 2.5, 0.2)),
+]
+GROK_RECOMPUTE_S = 300  # a desk gauge needn't be fresher than this; keeps the scan cheap
+_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0}
+
+
+def _grok_cost(model: str, fresh: int, output: int, cached: int) -> float:
+    """$ at API rates for one xAI turn, or 0 for a non-xAI/unknown model. Cached
+    reads are billed at the cheaper cacheRead rate; `fresh` is already the
+    non-cached input (see the subset note in _recompute_grok)."""
+    for prefix, (ci, co, cc) in XAI_RATES:
+        if model.startswith(prefix):
+            return (fresh * ci + output * co + cached * cc) / 1_000_000.0
+    return 0.0
+
+
+def _recompute_grok() -> tuple[float, float]:
+    """Scan the local Grok logs for this week's and today's xAI $ activity.
+
+    Two sources, same as PitCrew: the Grok CLI (~/.grok/sessions/*/*/updates.jsonl,
+    usage on `turn_completed` records) and Slate (~/.local/share/slate/storage/
+    message/*/msg_*.json, one assistant message each). In BOTH, cachedReadTokens
+    is a SUBSET of input, so fresh input = input - cached (billing it as-is would
+    massively overstate cost at a high cache rate). Files whose mtime predates the
+    week are skipped whole — their records are all older than the window."""
+    now = time.time()
+    week_cut = now - 7 * 86400
+    lt = time.localtime(now)
+    today_cut = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    week = today = 0.0
+
+    def add(cost: float, ts: float) -> None:
+        nonlocal week, today
+        if cost <= 0:
+            return
+        if ts >= week_cut:
+            week += cost
+        if ts >= today_cut:
+            today += cost
+
+    # Grok CLI — turn_completed carries a modelUsage map; timestamp is unix seconds.
+    try:
+        cli_files = list(GROK_SESSIONS.glob("*/*/updates.jsonl"))
+    except OSError:
+        cli_files = []
+    for f in cli_files:
+        try:
+            if f.stat().st_mtime < week_cut:
+                continue
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "turn_completed" not in line:  # cheap prefilter over a big log
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    up = (rec.get("params") or {}).get("update") or {}
+                    if up.get("sessionUpdate") != "turn_completed":
+                        continue
+                    ts = rec.get("timestamp")
+                    per_model = (up.get("usage") or {}).get("modelUsage") or {}
+                    if not ts or not per_model:
+                        continue
+                    for model, m in per_model.items():
+                        cached = m.get("cachedReadTokens") or 0
+                        fresh = max(0, (m.get("inputTokens") or 0) - cached)
+                        add(_grok_cost(model, fresh, m.get("outputTokens") or 0, cached), ts)
+        except OSError:
+            continue
+
+    # Slate — one JSON per message; model is "provider/model"; timestamp is unix ms.
+    try:
+        slate_files = list(SLATE_MESSAGES.glob("*/msg_*.json"))
+    except OSError:
+        slate_files = []
+    for f in slate_files:
+        try:
+            if f.stat().st_mtime < week_cut:
+                continue
+            rec = json.loads(f.read_text(encoding="utf-8"))
+            model = rec.get("model") or ""
+            if rec.get("role") != "assistant" or not model.startswith("xai/"):
+                continue
+            usage = rec.get("usage") or {}
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+            fresh = max(0, (usage.get("prompt_tokens") or 0) - cached)
+            cost = _grok_cost(model.split("/", 1)[1], fresh, usage.get("completion_tokens") or 0, cached)
+            add(cost, (rec.get("timestamp") or 0) / 1000.0)
+        except (OSError, ValueError):
+            continue
+
+    return week, today
 
 
 async def fetch_grok_usage() -> dict:
-    """Grok CLI weekly/today activity ($, at API rates) from PitCrew, or {}.
-
-    Returns {"g": <week>, "gd": <today>} when PitCrew is reachable, else {} so
-    the device simply shows no Grok data that tick. Deliberately swallows every
-    error: this is a best-effort side channel, and the Claude subscription
-    display must never depend on PitCrew being up.
-    """
+    """{"g": <week $>, "gd": <today $>} from the local logs, cached for
+    GROK_RECOMPUTE_S. Best-effort: any failure returns {} so the Claude display
+    is never affected. No network, no PitCrew — this daemon is self-sufficient."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as http:
-            resp = await http.get(PITCREW_USAGE_URL)
-        if resp.status_code != 200:
-            return {}
-        grok = resp.json().get("grok") or {}
-        if grok.get("weekUsd") is None:
-            return {}
-        return {"g": round(float(grok["weekUsd"])), "gd": round(float(grok.get("todayUsd", 0)))}
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as e:
-        log(f"Grok usage unavailable (PitCrew off?): {e}")
+        now = time.time()
+        if now - _grok_cache["ts"] >= GROK_RECOMPUTE_S:
+            week, today = _recompute_grok()
+            _grok_cache.update(ts=now, week=week, today=today)
+        return {"g": round(_grok_cache["week"]), "gd": round(_grok_cache["today"])}
+    except Exception as e:
+        log(f"Grok usage compute failed: {e}")
         return {}
 
 
