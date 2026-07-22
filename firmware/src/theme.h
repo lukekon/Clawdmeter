@@ -12,3 +12,10 @@
 #define THEME_AMBER    lv_color_hex(0xd97757)
 #define THEME_RED      lv_color_hex(0xc0392b)
 #define THEME_BAR_BG   lv_color_hex(0x2a2a28)   // unfilled bar track
+
+// Grok (xAI) bar palette — a sapphire→violet ramp, distinct from Claude's
+// green/amber/red. Grok's own brand is black/white, which reads poorly as a
+// bar fill, so its meters get their own cohesive deep-blue/purple family.
+#define THEME_GROK_LOW   lv_color_hex(0x3b6ef5)  // sapphire (low utilisation)
+#define THEME_GROK_MID   lv_color_hex(0x7a5cf0)  // violet   (mid)
+#define THEME_GROK_HIGH  lv_color_hex(0xb04ce6)  // purple   (near the weekly limit)

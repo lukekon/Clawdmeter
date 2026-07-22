@@ -305,6 +305,14 @@ static lv_color_t pct_color(float pct) {
     return COL_GREEN;
 }
 
+// Grok meters use their own sapphire→violet ramp (theme.h), not the green/amber/red
+// pace colours — Grok's black/white brand reads poorly as a bar fill.
+static lv_color_t grok_bar_color(float pct) {
+    if (pct >= 80.0f) return THEME_GROK_HIGH;
+    if (pct >= 50.0f) return THEME_GROK_MID;
+    return THEME_GROK_LOW;
+}
+
 static void format_reset_time(int mins, char* buf, size_t len) {
     if (mins < 0) {
         snprintf(buf, len, "---");
@@ -582,26 +590,47 @@ void ui_init(void) {
     }
 }
 
-// The device shows two providers on the one usage screen, flipping between them
-// every PROVIDER_CYCLE_MS: Claude's native subscription % (the trick only
-// Anthropic's headers allow) and Grok's activity in $ at API rates (from
-// PitCrew, present only while it's reachable). The last payload is cached so a
-// cycle can re-render without waiting for the next 60s poll.
-#define PROVIDER_CYCLE_MS 6000
+// The usage screen has three views, navigated MANUALLY by the side buttons
+// (left = previous, right = next): a combined Overview, a Claude detail view,
+// and a Grok detail view. Only the Overview animates — it auto-flips each
+// provider's two metrics every OVERVIEW_CYCLE_MS. The last payload is cached so
+// a flip or a view change re-renders without waiting for the next 60s poll.
+enum { VIEW_OVERVIEW = 0, VIEW_CLAUDE, VIEW_GROK, VIEW_COUNT };
+#define OVERVIEW_CYCLE_MS 10000
 static UsageData last_usage = {};
 static bool      have_usage = false;
-static int       provider_view = 0;         // 0 = Claude, 1 = Grok
-static uint32_t  provider_cycle_last = 0;
+static int       view_idx = VIEW_OVERVIEW;
+static int       overview_metric = 0;       // 0 = short windows, 1 = long windows
+static uint32_t  overview_cycle_last = 0;
 
 static void render_claude(const UsageData* data);
 static void render_grok(const UsageData* data);
+static void render_overview(const UsageData* data);
 
-// Grok view only when this payload actually carries Grok data; otherwise the
-// screen stays on Claude no matter where the cycle is.
 static void render_current(void) {
     if (!have_usage) return;
-    if (provider_view == 1 && last_usage.grok_valid) render_grok(&last_usage);
-    else                                             render_claude(&last_usage);
+    switch (view_idx) {
+        case VIEW_GROK:   render_grok(&last_usage);   break;
+        case VIEW_CLAUDE: render_claude(&last_usage); break;
+        default:          render_overview(&last_usage); break;
+    }
+}
+
+#ifdef UI_SHOT
+void ui_shot_set(int v, int m) {   // QA-only: jump straight to a view/metric
+    view_idx = v; overview_metric = m; render_current();
+}
+#endif
+
+// Side-button view navigation. dir = -1 (left/prev) or +1 (right/next), wrapping.
+void ui_cycle_view(int dir) {
+    if (current_screen != SCREEN_USAGE) return;
+    view_idx = (view_idx + dir + VIEW_COUNT) % VIEW_COUNT;
+    if (view_idx == VIEW_OVERVIEW) {          // land fresh on the short-window pairing
+        overview_metric = 0;
+        overview_cycle_last = lv_tick_get();
+    }
+    render_current();
 }
 
 void ui_update(const UsageData* data) {
@@ -632,6 +661,7 @@ static void render_claude(const UsageData* data) {
     lv_obj_clear_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_image_set_src(logo_img, &logo_dsc);
+    lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);   // Overview hides it; restore here
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
 
     if (data->enterprise) {
@@ -701,16 +731,19 @@ static void render_claude(const UsageData* data) {
     }
 }
 
-// Grok view — the same two-panel, %+bar layout as Claude so it reads identically,
-// but the % is spend against a budget (Grok has no server-side limit) and the $
-// rides the detail line. The xAI mark + neutral status colour distinguish it.
+// Grok detail view — mirrors Claude's two-panel %+bar+reset layout so it reads
+// identically. Both panels now show xAI's real weekly-limit utilisation (week =
+// the limit itself; today = how much of it was spent since midnight) with a reset
+// countdown on the detail line. Sapphire bars + the xAI mark + neutral status
+// colour distinguish it from Claude.
 static void render_grok(const UsageData* data) {
     char buf[48];
 
     lv_image_set_src(logo_img, &logo_grok_dsc);
+    lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);   // Overview hides it; restore here
     lv_obj_set_style_text_color(lbl_anim, COL_DIM, 0);
 
-    // Week panel → xAI's real weekly-limit %, bar, "$N this week" (activity $).
+    // Week panel → real weekly-limit %, bar, reset countdown.
     lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
@@ -720,20 +753,76 @@ static void render_grok(const UsageData* data) {
     int wpct = (int)(data->grok_week_pct + 0.5f);
     lv_label_set_text_fmt(lbl_session_pct, "%d%%", wpct);
     lv_bar_set_value(bar_session, wpct, LV_ANIM_ON);   // 0% → an honest empty bar
-    lv_obj_set_style_bg_color(bar_session, pct_color(data->grok_week_pct), LV_PART_INDICATOR);
-    snprintf(buf, sizeof(buf), "$%d this week", (int)(data->grok_week_usd + 0.5f));
+    lv_obj_set_style_bg_color(bar_session, grok_bar_color(data->grok_week_pct), LV_PART_INDICATOR);
+    format_reset_time(data->grok_week_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_session_reset, buf);
     lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
 
-    // Today panel → % of the weekly limit consumed today, bar, "$N today" (activity $).
+    // Today panel → % of the weekly limit spent today, bar, reset at local midnight.
     if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(lbl_weekly_label, "Grok today");
     int dpct = (int)(data->grok_today_pct + 0.5f);
     lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", dpct);
     lv_bar_set_value(bar_weekly, dpct, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar_weekly, pct_color(data->grok_today_pct), LV_PART_INDICATOR);
-    snprintf(buf, sizeof(buf), "$%d today", (int)(data->grok_today_usd + 0.5f));
+    lv_obj_set_style_bg_color(bar_weekly, grok_bar_color(data->grok_today_pct), LV_PART_INDICATOR);
+    format_reset_time(data->grok_today_reset_mins, buf, sizeof(buf));
+    lv_label_set_text(lbl_weekly_reset, buf);
+}
+
+// Overview — both providers on one screen. Top panel = Claude, bottom = Grok.
+// The corner logo is hidden (neither provider owns the screen); the panel labels
+// carry identity. Each provider's two metrics auto-flip together every
+// OVERVIEW_CYCLE_MS: metric 0 = the short windows (Claude 5h session / Grok today),
+// metric 1 = the long windows (Claude / Grok week).
+static void render_overview(const UsageData* data) {
+    char buf[48];
+
+    lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);     // combined view → no single logo
+    lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
+    lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
+    lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
+    if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- Top panel = Claude (session ↔ week) ----
+    if (overview_metric == 0) {
+        int p = (int)(data->session_pct + 0.5f);
+        lv_label_set_text(lbl_session_label, "Claude session");
+        lv_label_set_text_fmt(lbl_session_pct, "%d%%", p);
+        lv_bar_set_value(bar_session, p, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
+        format_reset_time(data->session_reset_mins, buf, sizeof(buf));
+    } else {
+        int p = (int)(data->weekly_pct + 0.5f);
+        lv_label_set_text(lbl_session_label, "Claude week");
+        lv_label_set_text_fmt(lbl_session_pct, "%d%%", p);
+        lv_bar_set_value(bar_session, p, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_session, pct_color(data->weekly_pct), LV_PART_INDICATOR);
+        format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
+    }
+    lv_label_set_text(lbl_session_reset, buf);
+
+    // ---- Bottom panel = Grok (today ↔ week) ----
+    if (overview_metric == 0) {
+        int p = (int)(data->grok_today_pct + 0.5f);
+        lv_label_set_text(lbl_weekly_label, "Grok today");
+        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", p);
+        lv_bar_set_value(bar_weekly, p, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_weekly, grok_bar_color(data->grok_today_pct), LV_PART_INDICATOR);
+        format_reset_time(data->grok_today_reset_mins, buf, sizeof(buf));
+    } else {
+        int p = (int)(data->grok_week_pct + 0.5f);
+        lv_label_set_text(lbl_weekly_label, "Grok week");
+        lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", p);
+        lv_bar_set_value(bar_weekly, p, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_weekly, grok_bar_color(data->grok_week_pct), LV_PART_INDICATOR);
+        format_reset_time(data->grok_week_reset_mins, buf, sizeof(buf));
+    }
     lv_label_set_text(lbl_weekly_reset, buf);
 }
 
@@ -767,19 +856,14 @@ void ui_tick_anim(void) {
 
     uint32_t now = lv_tick_get();
 
-    // Flip Claude ↔ Grok on the live panels every PROVIDER_CYCLE_MS. Only while
-    // showing live data and only when the last payload carried Grok — otherwise
-    // hold on Claude and keep the timer from drifting the moment Grok returns.
-    if (view_state == 2 && have_usage && last_usage.grok_valid) {
-        if (now - provider_cycle_last >= PROVIDER_CYCLE_MS) {
-            provider_cycle_last = now;
-            provider_view ^= 1;
+    // Auto-flip the Overview's two metrics every OVERVIEW_CYCLE_MS. Only the
+    // Overview animates — the top-level views are manual (side buttons).
+    if (view_state == 2 && view_idx == VIEW_OVERVIEW && have_usage) {
+        if (now - overview_cycle_last >= OVERVIEW_CYCLE_MS) {
+            overview_cycle_last = now;
+            overview_metric ^= 1;
             render_current();
         }
-    } else if (provider_view != 0) {
-        provider_view = 0;
-        provider_cycle_last = now;
-        render_current();
     }
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
@@ -818,7 +902,7 @@ void ui_tick_anim(void) {
     // model tag — the connection state still lives on the Claude frame the cycle
     // returns to. (Colour is set to COL_DIM in render_grok, back to COL_ACCENT in
     // render_claude.)
-    if (provider_view == 1 && s_ble_connected && view_state != 1) {
+    if (view_idx == VIEW_GROK && s_ble_connected && view_state != 1) {
         lv_label_set_text(lbl_anim, "xAI \xC2\xB7 Grok");
         return;
     }

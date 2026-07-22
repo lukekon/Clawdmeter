@@ -73,7 +73,7 @@ XAI_RATES = [
     ("grok-4.3", (1.25, 2.5, 0.2)),
 ]
 GROK_RECOMPUTE_S = 300  # a desk gauge needn't be fresher than this; keeps the scan cheap
-_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "wpct": 0, "dpct": 0}
+_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "wpct": 0, "dpct": 0, "wreset": -1}
 # The % bars come from xAI's OWN weekly limit, not a made-up $ budget. The Grok CLI
 # logs every billing refresh to unified.jsonl ("billing: fetched credits config" →
 # creditUsagePercent) — the exact number it prints as "Weekly limit: N%". We read that
@@ -181,17 +181,24 @@ def _iso_to_epoch(s) -> float | None:
         return None
 
 
-def read_grok_limit() -> tuple[int, int]:
+def _mins_until(epoch: float | None) -> int:
+    """Whole minutes from now until `epoch`, floored at 0; -1 if unknown."""
+    if not epoch:
+        return -1
+    return max(0, int((epoch - time.time()) // 60))
+
+
+def read_grok_limit() -> tuple[int, int, int]:
     """xAI's real weekly-limit utilisation, read from the Grok CLI's own billing log.
 
     The CLI logs a `billing: fetched credits config` line carrying `creditUsagePercent`
     every time it refreshes — the exact figure it shows as "Weekly limit: N%". We take
     the latest reading as the weekly %, and derive a "today" % by diffing it against the
     last reading before local midnight in the SAME billing period (Grok has no daily
-    limit of its own). Returns (week_pct, today_pct); 0/0 if the log is absent or
-    unreadable, so the bars just go empty rather than showing an invented number."""
+    limit of its own). Returns (week_pct, today_pct, week_reset_mins); 0/0/-1 if the log
+    is absent or unreadable, so the bars just go empty rather than show an invented value."""
     try:
-        readings = []  # (ts_epoch, pct, period_start)
+        readings = []  # (ts_epoch, pct, period_start, period_end)
         with open(GROK_LOG, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 if "billing: fetched credits config" not in line:  # cheap prefilter
@@ -204,46 +211,58 @@ def read_grok_limit() -> tuple[int, int]:
                 pct = cfg.get("creditUsagePercent")
                 if pct is None:
                     continue
-                period_start = (cfg.get("currentPeriod") or {}).get("start")
-                readings.append((_iso_to_epoch(rec.get("ts")), float(pct), period_start))
+                per = cfg.get("currentPeriod") or {}
+                readings.append((_iso_to_epoch(rec.get("ts")), float(pct),
+                                 per.get("start"), per.get("end")))
         if not readings:
-            return 0, 0
+            return 0, 0, -1
         readings.sort(key=lambda r: r[0] or 0.0)
-        _, week_pct, cur_period = readings[-1]
+        _, week_pct, cur_period, cur_end = readings[-1]
         lt = time.localtime()
         midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
         # Baseline = last same-period reading before today; none ⇒ 0 (week began today).
         baseline = 0.0
-        for ts, pct, ps in readings:
+        for ts, pct, ps, _pe in readings:
             if ps == cur_period and ts is not None and ts < midnight:
                 baseline = pct
         today_pct = max(0.0, week_pct - baseline)
         clamp = lambda v: max(0, min(100, int(round(v))))
-        return clamp(week_pct), clamp(today_pct)
+        return clamp(week_pct), clamp(today_pct), _mins_until(_iso_to_epoch(cur_end))
     except OSError:
-        return 0, 0
+        return 0, 0, -1
     except Exception as e:  # a log hiccup must never touch the Claude path
         log(f"Grok limit read failed: {e}")
-        return 0, 0
+        return 0, 0, -1
+
+
+def _mins_until_midnight() -> int:
+    """Minutes until the next local midnight — the 'today' bar's reset."""
+    lt = time.localtime()
+    next_midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, 0, 0, 0, 0, 0, -1))
+    return _mins_until(next_midnight)
 
 
 async def fetch_grok_usage() -> dict:
     """Grok fields for the BLE payload, cached for GROK_RECOMPUTE_S:
       g/gd    = week/today $ activity (at API rates — a gauge, not a bill)
       gwp/gdp = week/today % of xAI's real weekly limit (today = consumed since midnight)
+      gwr/gdr = minutes until the weekly limit resets / until local midnight
     Best-effort: any failure returns {} so the Claude display is never affected.
     No network, no PitCrew — this daemon is self-sufficient."""
     try:
         now = time.time()
         if now - _grok_cache["ts"] >= GROK_RECOMPUTE_S:
             week, today = _recompute_grok()
-            wpct, dpct = read_grok_limit()
-            _grok_cache.update(ts=now, week=week, today=today, wpct=wpct, dpct=dpct)
+            wpct, dpct, wreset = read_grok_limit()
+            _grok_cache.update(ts=now, week=week, today=today,
+                               wpct=wpct, dpct=dpct, wreset=wreset)
         return {
             "g": round(_grok_cache["week"]),
             "gd": round(_grok_cache["today"]),
             "gwp": _grok_cache["wpct"],
             "gdp": _grok_cache["dpct"],
+            "gwr": _grok_cache["wreset"],   # weekly-limit reset (mins)
+            "gdr": _mins_until_midnight(),  # today's reset = local midnight (mins)
         }
     except Exception as e:
         log(f"Grok usage compute failed: {e}")

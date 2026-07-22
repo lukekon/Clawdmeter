@@ -123,8 +123,10 @@ static bool parse_json(const char* json, UsageData* out) {
     out->grok_valid = !doc["g"].isNull();
     out->grok_week_usd = doc["g"] | 0.0f;
     out->grok_today_usd = doc["gd"] | 0.0f;
-    out->grok_week_pct = doc["gwp"] | 0.0f;   // % of weekly budget
-    out->grok_today_pct = doc["gdp"] | 0.0f;  // % of daily budget
+    out->grok_week_pct = doc["gwp"] | 0.0f;   // % of xAI's real weekly limit
+    out->grok_today_pct = doc["gdp"] | 0.0f;  // % of that limit used today
+    out->grok_week_reset_mins = doc["gwr"] | -1;
+    out->grok_today_reset_mins = doc["gdr"] | -1;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -180,6 +182,13 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+#ifdef UI_SHOT
+            else if (strncmp(cmd_buf, "shot ", 5) == 0) {
+                int v = 0, m = 0;
+                sscanf(cmd_buf + 5, "%d %d", &v, &m);
+                ui_shot_set(v, m);
+            }
+#endif
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -235,9 +244,30 @@ void setup() {
     input_hal_init();
 
     ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
+
+#ifdef UI_SHOT
+    // QA harness: fake a connected host + live payload and land on the usage
+    // screen so `screenshot` can capture each view over USB (no BLE needed).
+    // Drive views with the serial command "shot <view> <metric>".
+    ui_update_ble_status(BLE_STATE_CONNECTED, "Clawdmeter", "shot");
+    {
+        UsageData f = {};
+        f.session_pct = 74;  f.session_reset_mins = 158;
+        f.weekly_pct  = 9;   f.weekly_reset_mins  = 9878;
+        strlcpy(f.status, "allowed", sizeof(f.status));
+        f.grok_valid = true;
+        f.grok_week_pct  = 1;  f.grok_week_reset_mins  = 8449;
+        f.grok_today_pct = 1;  f.grok_today_reset_mins = 182;
+        f.grok_week_usd = 89;  f.grok_today_usd = 0;
+        f.ok = true; f.valid = true;
+        ui_update(&f);
+    }
+    ui_show_screen(SCREEN_USAGE);
+#else
+    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_show_screen(SCREEN_SPLASH);
+#endif
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
         board_caps().name, W, H);
@@ -306,43 +336,30 @@ void loop() {
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → on splash: cycle animations; on usage: cycle brightness;
-    //               hold ~3s + release: pairing mode
+    //   PRIMARY (left)    → previous usage view
+    //   SECONDARY (right) → next usage view (only if the board has a 2nd button)
+    //   PWR               → on splash: cycle animations; on usage: cycle brightness;
+    //                       hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
-    // idle_consume_wake_press(); the normal action fires from the second
-    // press. Activity bookkeeping happens inside idle_consume_wake_press
-    // so no separate idle_note_activity() call is needed here.
+    // idle_consume_wake_press(); the normal action fires from the second press.
+    // Activity bookkeeping happens inside idle_consume_wake_press so no separate
+    // idle_note_activity() call is needed here. We act on the rising edge only —
+    // the buttons no longer send HID keys, so releases carry no action.
     {
         static bool primary_was = false;
-        static bool primary_wake_swallowed = false;
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
-        if (primary_now != primary_was) {
-            if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
-            } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
-            }
-            primary_was = primary_now;
+        if (primary_now && !primary_was) {
+            if (!idle_consume_wake_press()) ui_cycle_view(-1);  // left = previous view
         }
+        primary_was = primary_now;
 
         if (board_caps().button_count >= 2) {
             static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
-            if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
-                }
-                secondary_was = secondary_now;
+            if (secondary_now && !secondary_was) {
+                if (!idle_consume_wake_press()) ui_cycle_view(+1);  // right = next view
             }
+            secondary_was = secondary_now;
         }
 
         if (power_hal_pwr_pressed()) {
@@ -357,11 +374,13 @@ void loop() {
         pair_tick();
     }
 
+#ifndef UI_SHOT
     ble_state_t bs = ble_get_state();
     if (bs != last_ble_state) {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
     }
+#endif
 
     static int  last_pct      = -2;
     static bool last_charging = false;

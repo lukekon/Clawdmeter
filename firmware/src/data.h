@@ -21,6 +21,8 @@ struct UsageData {
     float grok_today_usd;    // ...today
     float grok_week_pct;     // xAI's real weekly-limit utilisation % (0-100), from the Grok CLI
     float grok_today_pct;    // % of that weekly limit consumed today (Grok has no daily limit)
+    int grok_week_reset_mins;  // minutes until the weekly limit resets (-1 = unknown)
+    int grok_today_reset_mins; // minutes until local midnight ("today" resets there)
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
