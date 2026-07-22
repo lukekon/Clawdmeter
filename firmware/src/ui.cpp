@@ -3,6 +3,7 @@
 #include <lvgl.h>
 #include <time.h>
 #include "logo.h"
+#include "logo_grok.h"
 #include "icons.h"
 #include "hal/board_caps.h"
 
@@ -239,6 +240,7 @@ static const uint32_t DATA_FRESH_MS = 43200000;  // 12h
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
+static lv_image_dsc_t logo_grok_dsc;   // xAI mark, shown on the Grok view
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
@@ -555,6 +557,7 @@ void ui_init(void) {
 
     if (L.small_icons) init_icon_dsc_rgb565a8(&logo_dsc, LOGO_SMALL_WIDTH, LOGO_SMALL_HEIGHT, logo_small_data);
     else               init_icon_dsc_rgb565a8(&logo_dsc, LOGO_WIDTH, LOGO_HEIGHT, logo_data);
+    init_icon_dsc_rgb565a8(&logo_grok_dsc, GROK_LOGO_WIDTH, GROK_LOGO_HEIGHT, logo_grok_data);
     init_battery_icons();
 
     init_usage_screen(scr);
@@ -624,9 +627,12 @@ void ui_update(const UsageData* data) {
 static void render_claude(const UsageData* data) {
     int s_pct = (int)(data->session_pct + 0.5f);
 
-    // Coming back from the Grok view: restore the bars it hides.
+    // Coming back from the Grok view: restore the bars, the Claude logo, and the
+    // brand-orange status colour.
     lv_obj_clear_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(logo_img, &logo_dsc);
+    lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
 
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
@@ -695,38 +701,40 @@ static void render_claude(const UsageData* data) {
     }
 }
 
-// Format a $ figure compactly: whole dollars, or "<$1" so a small-but-nonzero
-// week never rounds to a flat "$0".
-static void fmt_usd(float v, char* buf, size_t n) {
-    if (v > 0.0f && v < 1.0f) snprintf(buf, n, "<$1");
-    else                       snprintf(buf, n, "$%d", (int)(v + 0.5f));
-}
-
-// Grok view — reuses the two panels but shows $ activity, not %. No bars: a
-// dollar figure has no natural 0-100 scale, and inventing a budget to fill one
-// is exactly the arbitrary number we're avoiding. The number carries it.
+// Grok view — the same two-panel, %+bar layout as Claude so it reads identically,
+// but the % is spend against a budget (Grok has no server-side limit) and the $
+// rides the detail line. The xAI mark + neutral status colour distinguish it.
 static void render_grok(const UsageData* data) {
     char buf[48];
 
-    // Session panel → "this week". Hide every %/enterprise overlay + the bar.
+    lv_image_set_src(logo_img, &logo_grok_dsc);
+    lv_obj_set_style_text_color(lbl_anim, COL_DIM, 0);
+
+    // Week panel → % of the weekly budget, bar, "$N this week".
     lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bar_session, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(lbl_session_label, "Grok week");
-    fmt_usd(data->grok_week_usd, buf, sizeof(buf));
-    lv_label_set_text(lbl_session_pct, buf);
-    lv_label_set_text(lbl_session_reset, "at API rates");
+    int wpct = (int)(data->grok_week_pct + 0.5f);
+    lv_label_set_text_fmt(lbl_session_pct, "%d%%", wpct);
+    lv_bar_set_value(bar_session, wpct, LV_ANIM_ON);   // 0% → an honest empty bar
+    lv_obj_set_style_bg_color(bar_session, pct_color(data->grok_week_pct), LV_PART_INDICATOR);
+    snprintf(buf, sizeof(buf), "$%d this week", (int)(data->grok_week_usd + 0.5f));
+    lv_label_set_text(lbl_session_reset, buf);
     lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
 
-    // Weekly panel → "today".
+    // Today panel → % of the daily budget, bar, "$N today".
     if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(lbl_weekly_label, "Grok today");
-    fmt_usd(data->grok_today_usd, buf, sizeof(buf));
-    lv_label_set_text(lbl_weekly_pct, buf);
-    lv_label_set_text(lbl_weekly_reset, "CLI + Slate");
+    int dpct = (int)(data->grok_today_pct + 0.5f);
+    lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", dpct);
+    lv_bar_set_value(bar_weekly, dpct, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(bar_weekly, pct_color(data->grok_today_pct), LV_PART_INDICATOR);
+    snprintf(buf, sizeof(buf), "$%d today", (int)(data->grok_today_usd + 0.5f));
+    lv_label_set_text(lbl_weekly_reset, buf);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -805,6 +813,15 @@ void ui_tick_anim(void) {
     anim_phase = (anim_phase + 1) % SPINNER_PHASES;
     anim_spinner_idx = (anim_phase < SPINNER_COUNT) ? anim_phase
                                                     : (SPINNER_PHASES - anim_phase);
+
+    // On the Grok view, drop the Claude-flavoured orange whimsy for a neutral
+    // model tag — the connection state still lives on the Claude frame the cycle
+    // returns to. (Colour is set to COL_DIM in render_grok, back to COL_ACCENT in
+    // render_claude.)
+    if (provider_view == 1 && s_ble_connected && view_state != 1) {
+        lv_label_set_text(lbl_anim, "xAI \xC2\xB7 Grok");
+        return;
+    }
 
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;

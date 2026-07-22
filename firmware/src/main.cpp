@@ -119,10 +119,12 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
-    // Grok activity — only present when PitCrew is reachable; absent → no Grok view.
+    // Grok activity — absent → no Grok view (daemon omits it if it can't compute).
     out->grok_valid = !doc["g"].isNull();
     out->grok_week_usd = doc["g"] | 0.0f;
     out->grok_today_usd = doc["gd"] | 0.0f;
+    out->grok_week_pct = doc["gwp"] | 0.0f;   // % of weekly budget
+    out->grok_today_pct = doc["gdp"] | 0.0f;  // % of daily budget
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;

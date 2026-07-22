@@ -74,6 +74,11 @@ XAI_RATES = [
 ]
 GROK_RECOMPUTE_S = 300  # a desk gauge needn't be fresher than this; keeps the scan cheap
 _grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0}
+# Claude's % is usage vs a server-given limit; Grok has no limit, so its % is
+# usage vs a BUDGET you set — the only honest way to turn a spend into a bar.
+# Weekly budget in $ (at API rates); the daily budget is a seventh of it.
+# Override with GROK_WEEKLY_BUDGET.
+GROK_WEEKLY_BUDGET = float(os.environ.get("GROK_WEEKLY_BUDGET", "150"))
 
 
 def _grok_cost(model: str, fresh: int, output: int, cached: int) -> float:
@@ -166,15 +171,26 @@ def _recompute_grok() -> tuple[float, float]:
 
 
 async def fetch_grok_usage() -> dict:
-    """{"g": <week $>, "gd": <today $>} from the local logs, cached for
-    GROK_RECOMPUTE_S. Best-effort: any failure returns {} so the Claude display
-    is never affected. No network, no PitCrew — this daemon is self-sufficient."""
+    """Grok fields for the BLE payload, cached for GROK_RECOMPUTE_S:
+      g/gd   = week/today $ (at API rates)
+      gwp/gdp = week/today % of budget (weekly / daily = weekly/7), 0-100
+    Best-effort: any failure returns {} so the Claude display is never affected.
+    No network, no PitCrew — this daemon is self-sufficient."""
     try:
         now = time.time()
         if now - _grok_cache["ts"] >= GROK_RECOMPUTE_S:
             week, today = _recompute_grok()
             _grok_cache.update(ts=now, week=week, today=today)
-        return {"g": round(_grok_cache["week"]), "gd": round(_grok_cache["today"])}
+        week, today = _grok_cache["week"], _grok_cache["today"]
+        daily_budget = GROK_WEEKLY_BUDGET / 7.0
+        def pct(v: float, budget: float) -> int:
+            return max(0, min(100, round(v / budget * 100))) if budget > 0 else 0
+        return {
+            "g": round(week),
+            "gd": round(today),
+            "gwp": pct(week, GROK_WEEKLY_BUDGET),
+            "gdp": pct(today, daily_budget),
+        }
     except Exception as e:
         log(f"Grok usage compute failed: {e}")
         return {}
@@ -501,12 +517,17 @@ class Session:
         self.refresh_requested.set()
 
     async def setup_refresh_subscription(self) -> None:
-        # The refresh subscription is optional — the 60s poll loop works without it.
-        # WinRT's start_notify() CCCD write can raise a raw OSError/WinError (not
-        # wrapped as BleakError) when the peer GATT server is transiently unavailable,
-        # e.g. a just-power-cycled ESP32 whose server is not yet ready (G-03-01, SC#3).
-        # Degrade gracefully instead of crashing the daemon so it stays single-process
-        # across a power-cycle reconnect (SC#4, no restart).
+        # The refresh subscription is optional — it only lets a button press trigger
+        # an instant re-poll; the 60s loop works without it. On this Windows + bonded-
+        # HID device it is also the ONE GATT op that hard-fails (WinRT cancels the CCCD
+        # write / "Unreachable") and takes the whole link DOWN with it, producing a
+        # connect→fail→disconnect→reconnect flap every ~10-20s (visible as the device
+        # unpairing/repairing and the battery icon blinking). Plain writes succeed
+        # through the same link, so skipping the subscribe keeps the connection stable
+        # and just costs button-press instant-refresh. Opt back in with
+        # CLAWDMETER_REFRESH_SUB=1 once the WinRT/bond interaction is understood.
+        if os.environ.get("CLAWDMETER_REFRESH_SUB") != "1":
+            return
         try:
             await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
         except (BleakError, ValueError, OSError) as e:
