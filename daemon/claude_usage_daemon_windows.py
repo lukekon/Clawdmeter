@@ -73,12 +73,13 @@ XAI_RATES = [
     ("grok-4.3", (1.25, 2.5, 0.2)),
 ]
 GROK_RECOMPUTE_S = 300  # a desk gauge needn't be fresher than this; keeps the scan cheap
-_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0}
-# Claude's % is usage vs a server-given limit; Grok has no limit, so its % is
-# usage vs a BUDGET you set — the only honest way to turn a spend into a bar.
-# Weekly budget in $ (at API rates); the daily budget is a seventh of it.
-# Override with GROK_WEEKLY_BUDGET.
-GROK_WEEKLY_BUDGET = float(os.environ.get("GROK_WEEKLY_BUDGET", "150"))
+_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "wpct": 0, "dpct": 0}
+# The % bars come from xAI's OWN weekly limit, not a made-up $ budget. The Grok CLI
+# logs every billing refresh to unified.jsonl ("billing: fetched credits config" →
+# creditUsagePercent) — the exact number it prints as "Weekly limit: N%". We read that
+# straight. Grok exposes only a weekly limit (no session/daily one like Claude), so the
+# "today" bar is derived: how much of that weekly % was consumed since local midnight.
+GROK_LOG = Path.home() / ".grok" / "logs" / "unified.jsonl"
 
 
 def _grok_cost(model: str, fresh: int, output: int, cached: int) -> float:
@@ -170,26 +171,79 @@ def _recompute_grok() -> tuple[float, float]:
     return week, today
 
 
+def _iso_to_epoch(s) -> float | None:
+    """'2026-07-22T00:25:59.541Z' → unix seconds, or None if unparseable."""
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def read_grok_limit() -> tuple[int, int]:
+    """xAI's real weekly-limit utilisation, read from the Grok CLI's own billing log.
+
+    The CLI logs a `billing: fetched credits config` line carrying `creditUsagePercent`
+    every time it refreshes — the exact figure it shows as "Weekly limit: N%". We take
+    the latest reading as the weekly %, and derive a "today" % by diffing it against the
+    last reading before local midnight in the SAME billing period (Grok has no daily
+    limit of its own). Returns (week_pct, today_pct); 0/0 if the log is absent or
+    unreadable, so the bars just go empty rather than showing an invented number."""
+    try:
+        readings = []  # (ts_epoch, pct, period_start)
+        with open(GROK_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "billing: fetched credits config" not in line:  # cheap prefilter
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                cfg = ((rec.get("ctx") or {}).get("config")) or {}
+                pct = cfg.get("creditUsagePercent")
+                if pct is None:
+                    continue
+                period_start = (cfg.get("currentPeriod") or {}).get("start")
+                readings.append((_iso_to_epoch(rec.get("ts")), float(pct), period_start))
+        if not readings:
+            return 0, 0
+        readings.sort(key=lambda r: r[0] or 0.0)
+        _, week_pct, cur_period = readings[-1]
+        lt = time.localtime()
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        # Baseline = last same-period reading before today; none ⇒ 0 (week began today).
+        baseline = 0.0
+        for ts, pct, ps in readings:
+            if ps == cur_period and ts is not None and ts < midnight:
+                baseline = pct
+        today_pct = max(0.0, week_pct - baseline)
+        clamp = lambda v: max(0, min(100, int(round(v))))
+        return clamp(week_pct), clamp(today_pct)
+    except OSError:
+        return 0, 0
+    except Exception as e:  # a log hiccup must never touch the Claude path
+        log(f"Grok limit read failed: {e}")
+        return 0, 0
+
+
 async def fetch_grok_usage() -> dict:
     """Grok fields for the BLE payload, cached for GROK_RECOMPUTE_S:
-      g/gd   = week/today $ (at API rates)
-      gwp/gdp = week/today % of budget (weekly / daily = weekly/7), 0-100
+      g/gd    = week/today $ activity (at API rates — a gauge, not a bill)
+      gwp/gdp = week/today % of xAI's real weekly limit (today = consumed since midnight)
     Best-effort: any failure returns {} so the Claude display is never affected.
     No network, no PitCrew — this daemon is self-sufficient."""
     try:
         now = time.time()
         if now - _grok_cache["ts"] >= GROK_RECOMPUTE_S:
             week, today = _recompute_grok()
-            _grok_cache.update(ts=now, week=week, today=today)
-        week, today = _grok_cache["week"], _grok_cache["today"]
-        daily_budget = GROK_WEEKLY_BUDGET / 7.0
-        def pct(v: float, budget: float) -> int:
-            return max(0, min(100, round(v / budget * 100))) if budget > 0 else 0
+            wpct, dpct = read_grok_limit()
+            _grok_cache.update(ts=now, week=week, today=today, wpct=wpct, dpct=dpct)
         return {
-            "g": round(week),
-            "gd": round(today),
-            "gwp": pct(week, GROK_WEEKLY_BUDGET),
-            "gdp": pct(today, daily_budget),
+            "g": round(_grok_cache["week"]),
+            "gd": round(_grok_cache["today"]),
+            "gwp": _grok_cache["wpct"],
+            "gdp": _grok_cache["dpct"],
         }
     except Exception as e:
         log(f"Grok usage compute failed: {e}")

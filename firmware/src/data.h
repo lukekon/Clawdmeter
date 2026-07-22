@@ -19,8 +19,8 @@ struct UsageData {
     bool grok_valid;         // "g" field present → the device can show a Grok view
     float grok_week_usd;     // Grok CLI+Slate spend this week, $ at API rates
     float grok_today_usd;    // ...today
-    float grok_week_pct;     // week $ as % of the weekly budget (0-100)
-    float grok_today_pct;    // today $ as % of the daily budget (0-100)
+    float grok_week_pct;     // xAI's real weekly-limit utilisation % (0-100), from the Grok CLI
+    float grok_today_pct;    // % of that weekly limit consumed today (Grok has no daily limit)
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };

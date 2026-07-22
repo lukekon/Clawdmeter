@@ -710,7 +710,7 @@ static void render_grok(const UsageData* data) {
     lv_image_set_src(logo_img, &logo_grok_dsc);
     lv_obj_set_style_text_color(lbl_anim, COL_DIM, 0);
 
-    // Week panel → % of the weekly budget, bar, "$N this week".
+    // Week panel → xAI's real weekly-limit %, bar, "$N this week" (activity $).
     lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
@@ -725,7 +725,7 @@ static void render_grok(const UsageData* data) {
     lv_label_set_text(lbl_session_reset, buf);
     lv_obj_clear_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
 
-    // Today panel → % of the daily budget, bar, "$N today".
+    // Today panel → % of the weekly limit consumed today, bar, "$N today" (activity $).
     if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(lbl_weekly_label, "Grok today");
