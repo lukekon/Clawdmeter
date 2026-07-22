@@ -18,7 +18,12 @@ Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
     -Name "ClawdmeterWatch" -Value $cmd
 Write-Host "Registered ClawdmeterWatch at logon (HKCU\Run, no admin)."
 
-# Launch it now so you don't have to log out/in.
-Start-Process powershell.exe `
-    -ArgumentList "-NoProfile","-WindowStyle","Hidden","-ExecutionPolicy","Bypass","-File","`"$Watch`""
-Write-Host "Watcher started. The daemon comes up whenever claude/grok/slate runs."
+# Launch it now, DETACHED. Win32_Process.Create spawns it under the WMI service,
+# not as a child of this console — so closing this window (or the shell exiting)
+# does NOT kill it. (Start-Process kept it in the console's process tree, which
+# Windows Terminal tears down on tab close.) At logon the HKCU\Run entry launches
+# it the same detached way.
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+    CommandLine = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watch`""
+} | Out-Null
+Write-Host "Watcher started (detached). The daemon comes up whenever claude/grok/slate runs."
