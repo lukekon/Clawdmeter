@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "splash.h"
 #include "usage_rate.h"
+#include "proto.h"
 #include <lvgl.h>
 #include <time.h>
 #include <string.h>
@@ -270,6 +271,7 @@ static lv_image_dsc_t logo_dsc;
 static lv_image_dsc_t logo_grok_dsc;   // xAI mark, shown on the Grok view
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
+static bool     s_proto = false;           // -DPITCREW_PROTO: static mock; UI fns no-op
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
 // Animation state
@@ -618,6 +620,14 @@ static void init_usage_screen(lv_obj_t* scr) {
 // ======== Public API ========
 
 void ui_init(void) {
+#ifdef PITCREW_PROTO
+    // Phase-A design prototype: render the static PitCrew vitals mock and skip
+    // the whole normal UI. The guards below make ui_update/tick/show_screen/
+    // ble_status no-op so main's setup/loop can't touch the uncreated widgets.
+    s_proto = true;
+    proto_render(lv_screen_active());
+    return;
+#endif
     compute_layout(board_caps());
 
     lv_obj_t* scr = lv_screen_active();
@@ -696,6 +706,10 @@ void ui_shot_set(int v, int m) {   // QA-only: jump straight to a view/metric
 
 // Side-button view navigation. dir = -1 (left/prev) or +1 (right/next), wrapping.
 void ui_cycle_view(int dir) {
+#ifdef PITCREW_PROTO
+    proto_cycle(dir);   // proto owns the whole screen; side buttons flip its views
+    return;
+#endif
     if (current_screen != SCREEN_USAGE) return;
     view_idx = (view_idx + dir + VIEW_COUNT) % VIEW_COUNT;
     if (view_idx == VIEW_OVERVIEW) {          // land fresh on the short-window pairing
@@ -706,6 +720,7 @@ void ui_cycle_view(int dir) {
 }
 
 void ui_update(const UsageData* data) {
+    if (s_proto) return;
     if (!data->valid) return;
     last_data_ms = lv_tick_get();   // a valid usage update just landed → dot goes green
     data_received = true;
@@ -938,6 +953,7 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
+    if (s_proto) return;
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick_one(&idle_creature);   // sleeping creature on idle
@@ -1034,6 +1050,7 @@ static void global_click_cb(lv_event_t* e) {
 }
 
 void ui_show_screen(screen_t screen) {
+    if (s_proto) return;
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -1063,6 +1080,7 @@ screen_t ui_get_current_screen(void) {
 }
 
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
+    if (s_proto) return;
     (void)name; (void)mac;
     bool was_connected = s_ble_connected;
     s_ble_connected = (state == BLE_STATE_CONNECTED);

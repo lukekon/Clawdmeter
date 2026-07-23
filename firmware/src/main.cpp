@@ -12,6 +12,9 @@
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
+#ifdef PITCREW_PROTO
+#include "proto.h"
+#endif
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -239,6 +242,9 @@ static void check_serial_cmd() {
                 sscanf(cmd_buf + 5, "%d %d", &v, &m);
                 ui_shot_set(v, m);
             }
+#endif
+#ifdef PITCREW_PROTO
+            else if (strncmp(cmd_buf, "pview ", 6) == 0) proto_set_view(atoi(cmd_buf + 6));
 #endif
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
