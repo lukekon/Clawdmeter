@@ -11,11 +11,14 @@
 
 $ErrorActionPreference = "Stop"
 $Repo  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Watch = Join-Path $Repo "clawdmeter-watch.ps1"
+$Vbs   = Join-Path $Repo "clawdmeter-watch.vbs"
 $TaskName = "ClawdmeterWatch"
 
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watch`""
+# Launch via the windowless VBS shim, NOT powershell.exe directly. Task Scheduler
+# running "powershell.exe -WindowStyle Hidden" still pops a taskbar window when
+# the default terminal is Windows Terminal (WT ignores -WindowStyle). wscript +
+# Run(cmd,0,False) creates the console hidden, so nothing ever shows.
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$Vbs`""
 
 # At-logon trigger, plus a 5-min repetition running indefinitely so a mid-session
 # death is recovered without waiting for the next logon.

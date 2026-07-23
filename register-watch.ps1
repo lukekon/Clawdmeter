@@ -11,19 +11,20 @@
 
 $ErrorActionPreference = "Stop"
 $Repo  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Watch = Join-Path $Repo "clawdmeter-watch.ps1"
+$Vbs   = Join-Path $Repo "clawdmeter-watch.vbs"
 
-$cmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watch`""
+# Launch via the windowless VBS shim (wscript). Running "powershell.exe
+# -WindowStyle Hidden" directly still shows a taskbar window when the default
+# terminal is Windows Terminal (WT ignores -WindowStyle); the shim never does.
+$cmd = "wscript.exe `"$Vbs`""
 Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
     -Name "ClawdmeterWatch" -Value $cmd
 Write-Host "Registered ClawdmeterWatch at logon (HKCU\Run, no admin)."
 
 # Launch it now, DETACHED. Win32_Process.Create spawns it under the WMI service,
 # not as a child of this console — so closing this window (or the shell exiting)
-# does NOT kill it. (Start-Process kept it in the console's process tree, which
-# Windows Terminal tears down on tab close.) At logon the HKCU\Run entry launches
-# it the same detached way.
+# does NOT kill it. At logon the HKCU\Run entry launches it the same windowless way.
 Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-    CommandLine = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Watch`""
+    CommandLine = "wscript.exe `"$Vbs`""
 } | Out-Null
-Write-Host "Watcher started (detached). The daemon comes up whenever claude/grok/slate runs."
+Write-Host "Watcher started (detached, windowless). The daemon comes up whenever claude/grok/slate runs."

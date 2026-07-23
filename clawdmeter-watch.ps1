@@ -14,6 +14,32 @@
 $ErrorActionPreference = "SilentlyContinue"
 
 $Repo      = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# --- Windowless self-heal --------------------------------------------------
+# However we were launched (Scheduled Task, HKCU\Run, manual), if we lack the
+# CLAWD_HIDDEN marker we were started as a visible powershell.exe. When the
+# default terminal is Windows Terminal, -WindowStyle Hidden is ignored and a
+# PowerShell window lands on the taskbar. Re-launch ourselves windowless via the
+# VBS shim (which sets CLAWD_HIDDEN) and exit, so any visible window closes.
+if (-not $env:CLAWD_HIDDEN) {
+    $vbs = Join-Path $Repo "clawdmeter-watch.vbs"
+    Start-Process wscript.exe -ArgumentList "`"$vbs`"" -WindowStyle Hidden | Out-Null
+    exit
+}
+
+# --- Single-instance lock --------------------------------------------------
+# The self-heal relaunch detaches each hidden watcher from whatever launched it
+# (Scheduled Task / Run entry), so the task's IgnoreNew dedup can't see it and a
+# revive would stack a second watcher. A named mutex makes this a true singleton:
+# the first hidden watcher holds it and runs; any later one can't acquire it and
+# exits immediately. Global\ (not Local\) so it dedups across ALL sessions — the
+# Scheduled Task and a Run-entry launch can land in different sessions. Held for
+# the process lifetime via the script-scoped variable.
+$script:WatchMutex = New-Object System.Threading.Mutex($false, "Global\ClawdmeterWatch")
+try { $gotLock = $script:WatchMutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $gotLock = $true }  # prior holder was killed
+if (-not $gotLock) { exit }
+
 $Daemon    = Join-Path $Repo "daemon\claude_usage_daemon_windows.py"
 $SitePkgs  = Join-Path $Repo ".venv\Lib\site-packages"
 $VenvPy    = Join-Path $Repo ".venv\Scripts\python.exe"
