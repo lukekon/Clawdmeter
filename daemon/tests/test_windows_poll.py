@@ -419,7 +419,7 @@ def test_wire_bytes_compact_json_shape(monkeypatch):
         payload = _run(poll_api("fake-token"))
 
     assert payload is not None
-    # Encode exactly as the wire layer will (Session.write_payload uses this form)
+    # Encode exactly as the wire layer will (write_payload uses this form)
     wire_bytes = json.dumps(payload, separators=(",", ":")).encode()
     wire_str = wire_bytes.decode()
 

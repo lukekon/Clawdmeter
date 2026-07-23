@@ -1,6 +1,8 @@
 # Windows-only dependency manifest for claude_usage_daemon_windows.py
 # The macOS/Linux daemons manage their own dependencies separately.
-bleak
+# Transport is USB serial (pyserial) — Windows' BLE stack couldn't hold a link
+# to the device, and the gauge is USB-powered/cabled at all times anyway.
+pyserial
 httpx
 pystray
 Pillow

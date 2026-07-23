@@ -4,17 +4,24 @@ This guide covers running the Clawdmeter Windows daemon on native Windows hardwa
 It includes the turnkey `install-windows.ps1` bootstrap (tray icon + login autostart),
 the manual-run fallback, and how to manage or remove autostart.
 
+> **Transport: USB serial, not Bluetooth.** Windows' BLE stack could not hold a
+> stable connection to the device, and the gauge is USB-powered (cabled at all
+> times) anyway — so the Windows daemon streams usage over the **USB-C serial
+> link** (the same port used to flash it). There is **no Bluetooth pairing** on
+> Windows: plug the device in and run the daemon. The pairing/BLE sections below
+> apply only to the macOS/Linux daemons, which still use BLE. The device firmware
+> accepts data over *either* transport, so nothing on the device needs changing.
+
 ---
 
 ## Prerequisites
 
 | Requirement | Details |
 |-------------|---------|
-| **Native Windows** | Must run on real Windows — not WSL. The script prints a warning and BLE will not work under WSL. |
+| **Native Windows** | Must run on real Windows — not WSL (WSL has no access to the USB serial port). |
 | **Python 3.11+** | Download from [python.org](https://www.python.org/downloads/) if not already installed. Ensure "Add python.exe to PATH" is checked during install. |
 | **Claude Code installed** | Install Claude Code and complete `claude login` so credentials exist on disk. |
-| **Clawdmeter powered on** | The device must be powered on and in range before the daemon starts. |
-| **Paired with Windows Bluetooth** | Pair the device once via **Settings → Bluetooth & devices → Add device** (see [Pair the device](#pair-the-device-one-time)). This is required — the device is a bonded BLE HID keyboard, so pairing enables its physical buttons and keeps a persistent connection that shows your last usage even when the daemon is stopped. |
+| **Clawdmeter plugged in via USB-C** | The device is USB-powered and streams data over the same cable. The daemon auto-detects its COM port (Espressif USB-CDC, VID 0x303A); override with `CLAWDMETER_SERIAL_PORT=COM3` if needed. **No Bluetooth pairing required.** |
 
 ### Where are my credentials?
 
@@ -33,16 +40,25 @@ absolute path or `CLAUDE_CONFIG_DIR` to a directory to override the search entir
 
 ---
 
-## Pair the device (one time)
+## Connect the device (USB-C)
 
-The Clawdmeter is a **bonded BLE HID keyboard** as well as a usage display — its firmware
-enables bonding (`NimBLEDevice::setSecurityAuth`) and advertises the HID service so its
-physical buttons act as a keyboard (Space / Shift+Tab). Pair it with Windows **once**,
-before running the daemon:
+On Windows there is **no pairing step** — just plug the Clawdmeter into a USB-C
+port. It enumerates as an Espressif USB-CDC serial device (VID `0x303A`, e.g.
+`COM3`), which the daemon finds automatically. To pin a specific port, set
+`CLAWDMETER_SERIAL_PORT=COM3`.
+
+> The pairing steps below are for the **macOS/Linux** daemons, which still use
+> BLE. On Windows they do not apply.
+
+### (macOS/Linux only) Pair the device over Bluetooth
+
+The Clawdmeter is also a **bonded BLE HID keyboard** — its firmware enables bonding
+(`NimBLEDevice::setSecurityAuth`) and advertises the HID service. On macOS/Linux, pair
+it with the OS **once** before running that platform's daemon:
 
 1. Put the device on its Bluetooth waiting screen (powered on, not yet connected).
-2. Open **Settings → Bluetooth & devices → Add device → Bluetooth**.
-3. Select **Clawdmeter** and complete pairing.
+2. Open the OS Bluetooth settings and add **Clawdmeter**.
+3. Complete pairing.
 
 **Why this is required:**
 

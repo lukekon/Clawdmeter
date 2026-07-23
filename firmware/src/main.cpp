@@ -132,10 +132,45 @@ static bool parse_json(const char* json, UsageData* out) {
     return true;
 }
 
+// Run a usage JSON payload through the rate tracker + UI. Shared by both
+// transports: the BLE RX characteristic and (on desktops where BLE is
+// unreliable) the USB-serial data link. Returns false if the JSON didn't parse.
+static bool process_usage_json(const char* json) {
+    if (!parse_json(json, &usage)) return false;
+    int g_before = usage_rate_group();
+    bool session_reset = usage_rate_sample(usage.session_pct);
+    int g_after = usage_rate_group();
+    // 5-hour session limit refilled → chime so the user knows they can use
+    // Claude again (no-op on boards without a buzzer). Gated on the daemon's
+    // opt-in `chime` config; the `buzz` serial cmd ignores it.
+    if (session_reset && usage.chime) {
+        Serial.println("session reset detected — chime");
+        sound_hal_play_reset();
+    }
+    if (g_after != g_before) {
+        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+            g_before, g_after, usage.session_pct);
+        if (splash_is_active()) splash_pick_for_current_rate();
+    }
+    ui_update(&usage);
+    return true;
+}
+
 // ---- Serial command buffer ----
-#define CMD_BUF_SIZE 64
+// Sized to hold a full usage JSON payload: on desktops where BLE won't stay
+// connected, the daemon streams the same JSON over USB serial (a line starting
+// with '{') instead of writing the BLE RX characteristic.
+#define CMD_BUF_SIZE 512
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
+
+// USB-serial data link. Latches true on the first usage payload received over
+// serial: from then on the cable is THE transport for this session, so the
+// (unused, still-advertising) BLE radio must never flip the connection UI back
+// to "pairing", and the display holds the last numbers between polls like a desk
+// gauge. Data freshness (12h in ui.cpp) — not link state — decides usage vs idle,
+// so the device keeps showing the last sync even while the daemon is stopped.
+static bool serial_link_ever = false;
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
@@ -180,7 +215,23 @@ static void check_serial_cmd() {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
-            if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            if (cmd_buf[0] == '{') {
+                // Usage payload over USB serial — transport-equivalent to a BLE
+                // RX write. No owner/encryption checks: the cable is the link.
+                bool first = !serial_link_ever;
+                if (process_usage_json(cmd_buf)) {
+                    serial_link_ever = true;
+                    // Show "connected" off the cable and, on the very first
+                    // payload, surface the usage screen so a reflash visibly lands.
+                    ui_update_ble_status(BLE_STATE_CONNECTED, "USB", "serial");
+                    if (first && ui_get_current_screen() == SCREEN_SPLASH)
+                        ui_show_screen(SCREEN_USAGE);
+                    Serial.println("{\"ack\":true}");
+                } else {
+                    Serial.println("{\"err\":true}");
+                }
+            }
+            else if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
 #ifdef UI_SHOT
             else if (strncmp(cmd_buf, "shot ", 5) == 0) {
@@ -375,10 +426,14 @@ void loop() {
     }
 
 #ifndef UI_SHOT
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+    // Once the USB-serial link has delivered data it owns the connection UI;
+    // don't let the (unused, still-advertising) BLE radio flip it to "pairing".
+    if (!serial_link_ever) {
+        ble_state_t bs = ble_get_state();
+        if (bs != last_ble_state) {
+            last_ble_state = bs;
+            ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
+        }
     }
 #endif
 
@@ -395,27 +450,8 @@ void loop() {
     check_serial_cmd();
 
     if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_play_reset();
-            }
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
+        if (process_usage_json(ble_get_data())) ble_send_ack();
+        else                                    ble_send_nack();
     }
 
     delay(5);

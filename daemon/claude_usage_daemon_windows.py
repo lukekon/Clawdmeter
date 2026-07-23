@@ -15,32 +15,30 @@ import logging.handlers
 import os
 import re
 import signal
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 import httpx
-from bleak import BleakClient, BleakScanner
-from bleak.backends.device import BLEDevice
-from bleak.exc import BleakError
+import serial
+import serial.tools.list_ports
 
 DEVICE_NAME = "Clawdmeter"
-SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
-RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
-REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+
+# --- USB-serial transport --------------------------------------------------
+# The device is a USB-powered desk gauge that is physically cabled to this PC at
+# all times (it has no battery — unplugging powers it off). Windows' BLE stack
+# proved unable to hold a connection to it, so the daemon streams the same JSON
+# usage payload over the USB-serial link (the ESP32-S3 native USB-CDC, the same
+# port used for flashing/screenshots) instead of the BLE RX characteristic. The
+# firmware accepts a newline-terminated JSON line on that port as a data write.
+SERIAL_BAUD = 115200
+ESP32_VID = 0x303A         # Espressif — the ESP32-S3 native USB-JTAG/CDC vendor id
+SERIAL_WRITE_TIMEOUT = 5.0
 
 POLL_INTERVAL = 60
-TICK = 5
-SCAN_TIMEOUT = 8.0         # seconds to scan for the advertising device (not-yet-OS-paired)
-CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
-CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
-ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
-                           # N=1: breaks at T=60s, leaves ~60s headroom for reconnect+poll inside 120s SLA
-                           # N=2 would bust the 120s budget before reconnect even begins
-RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked retries inside 120s SLA
-                           # ~5–10s band per CONTEXT.md Claude's Discretion; 8 chosen as middle ground
+PORT_RETRY_BACKOFF_CAP = 30  # gentle backoff while the port is absent (device unplugged / reflashing)
 
 # Optional reset chime.
 # Optional clock display. 
@@ -504,134 +502,60 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     }
 
 
-def _mac_from_pnp_instance_id(instance_id: str) -> str | None:
-    """Recover a canonical BLE MAC ("AA:BB:CC:DD:EE:FF") from a PnP instance id.
+def find_serial_port() -> str | None:
+    """Return the COM port of the cabled Clawdmeter, or None.
 
-    Windows encodes a paired BLE device's address in its PnP instance id as a
-    12-hex run after a ``DEV_`` token, e.g.::
+    Priority:
+      1. CLAWDMETER_SERIAL_PORT env override (pinning / testing).
+      2. The Espressif native USB-CDC port (VID 0x303A) — the ESP32-S3.
+      3. If exactly one serial port is present, use it.
 
-        BTHLE\\DEV_98A316A5D706\\7&B8081D1&0&98A316A5D706  ->  98:A3:16:A5:D7:06
-
-    Returns None when no ``DEV_<12 hex>`` token is present. Pure — the
-    subprocess that produces the instance id lives in discover_bonded_address().
+    Returns None when nothing plausible is present — device unplugged, or the
+    port is momentarily held by a flash/screenshot — so the caller backs off and
+    retries rather than crashing.
     """
-    m = re.search(r"DEV_([0-9A-Fa-f]{12})(?![0-9A-Fa-f])", instance_id)
-    if not m:
-        return None
-    h = m.group(1).upper()
-    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
-
-
-def discover_bonded_address() -> str | None:
-    """Return the BLE address of the bonded Clawdmeter, or None.
-
-    A device that is paired AND connected to Windows stops advertising, so
-    BleakScanner can't see it (the steady state once paired — see
-    README-windows.md). WinRT can still connect to it directly by address, so
-    we recover that address from the OS:
-
-    1. CLAWDMETER_BLE_ADDRESS env override (skips discovery — testing / pinning).
-    2. Windows PnP table, filtered to the device's FriendlyName.
-
-    Non-Windows or any failure returns None.
-    """
-    if override := os.environ.get("CLAWDMETER_BLE_ADDRESS"):
-        return override.strip().upper()
-    if sys.platform != "win32":
-        return None
-    command = (
-        "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | "
-        f"Where-Object {{ $_.FriendlyName -eq '{DEVICE_NAME}' }} | "
-        "Select-Object -ExpandProperty InstanceId"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"Bonded-address lookup failed: {e}")
-        return None
-    for line in result.stdout.splitlines():
-        if mac := _mac_from_pnp_instance_id(line):
-            return mac
+    if override := os.environ.get("CLAWDMETER_SERIAL_PORT"):
+        return override.strip()
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        if p.vid == ESP32_VID:
+            return p.device
+    if len(ports) == 1:
+        return ports[0].device
     return None
 
 
-async def acquire_target():
-    """Return a connectable handle for the Clawdmeter, or None.
+def open_serial(port: str) -> "serial.Serial":
+    """Open the port WITHOUT asserting DTR/RTS.
 
-    Targets only the device bonded to THIS machine (via the PnP table /
-    CLAWDMETER_BLE_ADDRESS) — it never scans for a nearby device by name, so it
-    can't grab a stranger's or the wrong nearby unit. The device must be paired
-    with Windows once first (the documented setup). Returns a BLEDevice or None.
+    On the ESP32-S3 native USB-CDC (USB-Serial-JTAG), asserting DTR/RTS on open
+    is the auto-reset line esptool uses — a plain open would reboot the device to
+    its splash screen every time the daemon (re)connects. Pre-setting both lines
+    low before open keeps the device running so it just picks up the next payload.
     """
-    # The Windows "Add device" pairing wizard can't connect to this unit (confirmed:
-    # the device never logs a connection from it), but a direct WinRT connect works.
-    # So we DON'T rely on the OS having paired it — we scan for the advertising device
-    # and let the daemon bond it itself (client.pair() in connect_and_run).
-    address = discover_bonded_address()  # env override, or PnP if it ever is OS-paired
-    try:
-        if address:
-            dev = await BleakScanner.find_device_by_address(address, timeout=SCAN_TIMEOUT)
-        else:
-            dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
-        if dev:
-            log(f"Found {DEVICE_NAME} advertising at {dev.address}")
-            return dev
-    except Exception as e:
-        log(f"Scan for {DEVICE_NAME} failed: {e}")
-    # Fallback: OS-paired device that has stopped advertising — connect by address.
-    if address:
-        log(f"Not advertising; connecting to bonded address {address}")
-        return BLEDevice(address, DEVICE_NAME, None)
-    return None
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = SERIAL_BAUD
+    ser.timeout = 1
+    ser.write_timeout = SERIAL_WRITE_TIMEOUT
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    return ser
 
 
-class Session:
-    def __init__(self, client: BleakClient) -> None:
-        self.client = client
-        self.refresh_requested = asyncio.Event()
+def write_payload(ser: "serial.Serial", payload: dict) -> None:
+    """Write one usage payload as a newline-terminated JSON line.
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
-
-    async def setup_refresh_subscription(self) -> None:
-        # The refresh subscription is optional — it only lets a button press trigger
-        # an instant re-poll; the 60s loop works without it. On this Windows + bonded-
-        # HID device it is also the ONE GATT op that hard-fails (WinRT cancels the CCCD
-        # write / "Unreachable") and takes the whole link DOWN with it, producing a
-        # connect→fail→disconnect→reconnect flap every ~10-20s (visible as the device
-        # unpairing/repairing and the battery icon blinking). Plain writes succeed
-        # through the same link, so skipping the subscribe keeps the connection stable
-        # and just costs button-press instant-refresh. Opt back in with
-        # CLAWDMETER_REFRESH_SUB=1 once the WinRT/bond interaction is understood.
-        if os.environ.get("CLAWDMETER_REFRESH_SUB") != "1":
-            return
-        try:
-            await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
-        except (BleakError, ValueError, OSError) as e:
-            log(f"Refresh subscription unavailable: {e}")
-
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
-        log(f"Sending: {data.decode()}")
-        try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
-            return True
-        except (BleakError, OSError) as e:
-            # WinRT can raise a raw OSError/WinError (NOT wrapped as BleakError)
-            # when the peer GATT server goes transiently unavailable mid-write —
-            # the same failure class setup_refresh_subscription() guards against.
-            # Returning False trips the zombie-link break -> clean reconnect,
-            # rather than an uncaught exception killing the daemon thread (the
-            # silent-freeze failure mode, SC#2 field report).
-            log(f"Write failed: {e}")
-            return False
+    The firmware treats a line beginning with '{' on the USB-serial port as a
+    data write (transport-equivalent to the old BLE RX characteristic). Raises
+    serial.SerialException / OSError if the port has gone away (device unplugged
+    or reflashing), which the main loop catches to reopen.
+    """
+    line = json.dumps(payload, separators=(",", ":")) + "\n"
+    log(f"Sending: {line.strip()}")
+    ser.write(line.encode())
+    ser.flush()
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -733,163 +657,38 @@ def _read_expiry() -> str:
     return "expiry unknown"
 
 
-async def _wait_first(*events: asyncio.Event, timeout: float) -> None:
-    """Return when any of `events` is set, or after `timeout` seconds.
+async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
+    """Poll the API once and stream the payload over the serial link.
 
-    Lets the poll loop's TICK wait wake immediately on a stop signal (clean,
-    responsive Quit) without losing the refresh-request wakeup — instead of
-    waiting only on refresh_requested and re-checking stop_event up to TICK
-    later. Cancels and drains the loser tasks so they don't warn.
+    Reads a fresh token each call. Token/API failures are handled inline (they
+    don't invalidate the cable); a serial write error propagates to the caller,
+    which reopens the port. Silent no-op when there's nothing valid to send.
     """
-    tasks = [asyncio.ensure_future(e.wait()) for e in events]
+    token = read_token()  # fresh each cycle
+    if not token:
+        log("No token; skipping poll")
+        if tray_state:
+            tray_state.set_error("token expired — run claude login")
+        return
     try:
-        await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) -> bool:
-    """Connect to device and poll until disconnected or stopped.
-
-    Returns True if at least one successful write occurred.
-
-    `device` is a BLEDevice — either from an advertisement scan or built from the
-    bonded address by acquire_target(). The getattr keeps the log line robust if a
-    bare address string is ever passed in.
-    """
-    log(f"Connecting to {getattr(device, 'address', device)}...")
-    # D-01: retry wrapper — defeats WinRT post-wake failure modes
-    # (Could not get GATT services: Unreachable, stale is_connected).
-    # Rebuild a fresh BleakClient each attempt (locked D-05 recipe).
-    client = None
-    for attempt in range(CONNECT_RETRIES):
-        # WinRT-backend options MUST be nested under winrt={...} — passing them as
-        # top-level kwargs silently drops them. use_cached_services=False forces a
-        # fresh GATT read (DIY firmware; cache may be stale after a reflash).
-        client = BleakClient(
-            device,
-            winrt={"use_cached_services": False},
-        )
-        try:
-            await client.connect()
-            # The device requires a bonded+encrypted link for writes, but the Windows
-            # pairing wizard can't reach it. Bond it ourselves over the live connection.
-            # Idempotent: a no-op / benign error if already paired, so we swallow it.
-            try:
-                await client.pair()
-                log("Paired (programmatic)")
-            except Exception as pe:
-                log(f"pair() note: {type(pe).__name__}: {pe}")
-        except (BleakError, OSError, asyncio.TimeoutError, AssertionError) as e:
-            # WinRT service discovery inside connect() can surface a raw OSError
-            # (WinError) or even a bare AssertionError from bleak's FutureLike
-            # (assert self._result) when the peer drops the link mid-discovery —
-            # neither is wrapped as BleakError. Treat them as a normal failed
-            # attempt so the D-01 retry loop handles them, instead of letting an
-            # uncaught exception kill the daemon thread (the "daemon crashed"
-            # tray toast + silent polling stop, field report).
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {type(e).__name__}: {e}")
-            try:
-                await client.disconnect()
-            except BleakError:
-                pass
-            if attempt < CONNECT_RETRIES - 1:
-                await asyncio.sleep(CONNECT_RETRY_DELAY)
-            continue
-
-        if not client.is_connected:
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed (not connected)")
-            try:
-                await client.disconnect()
-            except BleakError:
-                pass
-            if attempt < CONNECT_RETRIES - 1:
-                await asyncio.sleep(CONNECT_RETRY_DELAY)
-            continue
-
-        # Connected successfully
-        break
-    else:
-        log(f"Connection failed after {CONNECT_RETRIES} attempts")
-        return False
-
-    log("Connected")
-    session = Session(client)
-    await session.setup_refresh_subscription()
-
-    last_poll = 0.0  # D-03: poll immediately on first connect
-    used_successfully = False
-    consecutive_failures = 0  # D-03: zombie-link break counter
-    try:
-        while client.is_connected and not stop_event.is_set():
-            now = time.time()
-            elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
-                session.refresh_requested.clear()
-                token = read_token()  # D-09: fresh each cycle
-                if not token:
-                    log("No token; skipping poll")
-                    if tray_state:
-                        tray_state.set_error("token expired — run claude login")
-                else:
-                    try:
-                        payload = await poll_api(token)
-                    except AuthError:
-                        # Real 401/403 — token genuinely needs a refresh.
-                        if tray_state:
-                            tray_state.set_error("token expired — run claude login")
-                        payload = None
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
-                            consecutive_failures = 0  # D-03: reset on success
-                            if tray_state:
-                                tray_state.set_connected(time.time())
-                        else:
-                            consecutive_failures += 1
-                            if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
-                                log(
-                                    f"Zombie link detected ({consecutive_failures} consecutive"
-                                    f" write failures); abandoning connection"
-                                )
-                                break
-                    # else: payload is None from a TRANSIENT failure (network/DNS,
-                    # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
-                    # toast "token expired" — that mislabeled a boot-time DNS blip
-                    # as an auth problem (SC#5). Leave tray state unchanged; the next
-                    # tick retries and set_connected() recovers it.
-
-            # Wake on a refresh request OR a stop, whichever comes first. Waking
-            # promptly on stop_event is what lets the finally below run
-            # client.disconnect() before the process exits, so the peer gets a
-            # clean GATT disconnect (returns to its waiting screen) instead of
-            # being left frozen on stale data after Quit (SC#3 graceful shutdown).
-            await _wait_first(session.refresh_requested, stop_event, timeout=TICK)
-    finally:
-        # Clean GATT disconnect on the way out — this is what tells the peripheral
-        # the link is gone. WinRT can surface a raw OSError (not BleakError) here,
-        # so swallow both; the link tears down regardless once we exit.
-        try:
-            await client.disconnect()
-        except (BleakError, OSError, AssertionError):
-            # bleak's WinRT disconnect() also has bare asserts (e.g. assert char
-            # while tearing down notifications on an already-gone peer); swallow
-            # it too — the link tears down regardless once we exit.
-            pass
-
-    log("Device disconnected" if not stop_event.is_set() else "Stopping")
-    return used_successfully
+        payload = await poll_api(token)
+    except AuthError:
+        # Real 401/403 — token genuinely needs a refresh.
+        if tray_state:
+            tray_state.set_error("token expired — run claude login")
+        return
+    if payload is None:
+        # Transient failure (network/DNS, timeout, rate-limit, 5xx). poll_api
+        # already logged it; do NOT toast "token expired" (that mislabeled a
+        # boot-time DNS blip as an auth problem, SC#5). Next poll retries.
+        return
+    write_payload(ser, payload)   # raises serial.SerialException/OSError on a dead port
+    if tray_state:
+        tray_state.set_connected(time.time())
 
 
 def _next_backoff(current: int, cap: int) -> int:
-    """D-05: double current backoff value, clamped to cap.
-
-    Pure helper — unit-testable without driving the main loop.
-    Used by both slow-search (cap=60) and fast-reconnect (cap=RECONNECT_BACKOFF_CAP) regimes.
-    """
+    """Double `current`, clamped to `cap`. Pure helper for the port-retry backoff."""
     return min(current * 2, cap)
 
 
@@ -924,49 +723,74 @@ async def main(tray_state=None) -> None:
                     # Not the main thread of the main interpreter — tray owns shutdown.
                     pass
 
-    log("=== Claude Usage Tracker Daemon (BLE, Windows) ===")
+    log("=== Claude Usage Tracker Daemon (USB serial, Windows) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
-    # D-05: two distinct backoff regimes — slow-search (device absent) vs fast-reconnect (link dropped)
-    search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
-    reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
-    while not stop_event.is_set():
-        device = await acquire_target()
-        if not device:
-            # Slow-search regime: device was not found by scan — back off gently
-            if tray_state:
-                tray_state.set_scanning()
-            log(f"Device not found, retrying in {search_backoff}s...")
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=search_backoff)
-            except asyncio.TimeoutError:
-                pass
-            search_backoff = _next_backoff(search_backoff, 60)
-            continue
+    async def sleep_or_stop(secs: float) -> None:
+        """Sleep up to `secs`, waking immediately if a stop is requested."""
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=secs)
+        except asyncio.TimeoutError:
+            pass
 
-        ok = await connect_and_run(device, stop_event, tray_state)
-        if not ok:
-            # Fast-reconnect regime: had/attempted a link that dropped — retry quickly
-            if tray_state:
-                tray_state.set_scanning()
-            log(f"Connection lost, reconnecting in {reconnect_backoff}s...")
+    ser = None
+    port_backoff = 1
+    try:
+        while not stop_event.is_set():
+            # (Re)open the serial port if we don't have a live one. The port is
+            # briefly absent when the device is unplugged or while it's being
+            # reflashed, so we back off gently rather than spin.
+            if ser is None:
+                port = find_serial_port()
+                if not port:
+                    if tray_state:
+                        tray_state.set_scanning()
+                    log(f"Clawdmeter serial port not found; retrying in {port_backoff}s...")
+                    await sleep_or_stop(port_backoff)
+                    port_backoff = _next_backoff(port_backoff, PORT_RETRY_BACKOFF_CAP)
+                    continue
+                try:
+                    ser = open_serial(port)
+                except (serial.SerialException, OSError) as e:
+                    # Port exists but is held (a flash/screenshot has it) or vanished
+                    # between listing and opening — treat like "not found".
+                    log(f"Opening {port} failed: {e}")
+                    ser = None
+                    if tray_state:
+                        tray_state.set_scanning()
+                    await sleep_or_stop(port_backoff)
+                    port_backoff = _next_backoff(port_backoff, PORT_RETRY_BACKOFF_CAP)
+                    continue
+                log(f"Opened {port} @ {SERIAL_BAUD} baud")
+                port_backoff = 1
+
+            # One poll + send. A serial error means the cable/device went away —
+            # drop the port and reopen on the next iteration.
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=reconnect_backoff)
-            except asyncio.TimeoutError:
+                await poll_and_send(ser, tray_state)
+            except (serial.SerialException, OSError) as e:
+                log(f"Serial link lost: {e}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+                if tray_state:
+                    tray_state.set_scanning()
+                await sleep_or_stop(1)
+                continue
+
+            await sleep_or_stop(POLL_INTERVAL)
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
                 pass
-            reconnect_backoff = _next_backoff(reconnect_backoff, RECONNECT_BACKOFF_CAP)
-        else:
-            # Successful session — reset reconnect counter to floor; search_backoff also reset
-            reconnect_backoff = 1
-            search_backoff = 1
+    log("Stopping")
 
 
 if __name__ == "__main__":
-    if sys.platform != "win32":
-        print(
-            "Warning: running under Linux/WSL — WinRT BLE will not be available.",
-            file=sys.stderr,
-        )
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

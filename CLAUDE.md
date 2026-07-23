@@ -170,6 +170,8 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
 
+**Windows uses USB serial, not BLE.** `daemon/claude_usage_daemon_windows.py` streams the same JSON payload over the device's USB-CDC serial port (pyserial) instead of BLE — Windows' BLE stack couldn't hold a stable link, and the gauge is USB-cabled anyway. It auto-detects the Espressif port (VID `0x303A`), opens it *without* asserting DTR/RTS (so it doesn't reset the ESP32), and writes a newline-terminated JSON line every 60s. The firmware accepts a `{`-prefixed serial line as a data write (`process_usage_json` in `main.cpp`), shared with the BLE RX path; the first serial payload latches `serial_link_ever`, which makes the cable own the connection UI and switches splash→usage. The `clawdmeter-watch.ps1` watcher runs the daemon only while an AI CLI is active — so flashing needs the daemon killed first (it holds the COM port). macOS/Linux still use BLE.
+
 **Discovery & resilience:**
 
 - Connects by name (`"Clawdmeter"`) on first run, caches resolved MAC at `~/.config/claude-usage-monitor/ble-address`. ESP32 BLE addresses are factory-burned per-chip, so swapping any board invalidates the cache.
