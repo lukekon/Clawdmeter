@@ -1,7 +1,9 @@
 #include "ui.h"
 #include "splash.h"
+#include "usage_rate.h"
 #include <lvgl.h>
 #include <time.h>
+#include <string.h>
 #include "logo.h"
 #include "logo_grok.h"
 #include "icons.h"
@@ -217,6 +219,29 @@ static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
+// ---- Session sparkline: the last SPARK_N session-% samples (≈48 min at the
+//      60s poll) as a compact trend line on the Claude view's session panel.
+//      Fed from ui_update(); LVGL reads spark_y directly as the chart's ext array.
+#define SPARK_N 48
+static lv_obj_t*          spark_chart = nullptr;
+static lv_chart_series_t* spark_ser   = nullptr;
+static int32_t            spark_y[SPARK_N];   // LVGL 9 chart arrays are int32_t
+static int                spark_count = 0;
+
+static void spark_push(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (spark_count < SPARK_N) {
+        spark_y[spark_count++] = (int32_t)pct;
+    } else {
+        memmove(&spark_y[0], &spark_y[1], (SPARK_N - 1) * sizeof(int32_t));
+        spark_y[SPARK_N - 1] = (int32_t)pct;
+    }
+    // Leave the not-yet-filled tail as gaps so the line grows in from the left.
+    for (int i = spark_count; i < SPARK_N; i++) spark_y[i] = LV_CHART_POINT_NONE;
+    if (spark_chart) lv_chart_refresh(spark_chart);
+}
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -227,6 +252,8 @@ static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 // connected but no usage update landed within DATA_FRESH_MS, the pairing hint
 // when BLE is down. Re-evaluated every loop in ui_tick_anim().
 static lv_obj_t* idle_group;            // the "Zzz" idle screen
+static splash_mini_t idle_creature = {};    // sleeping creature on the idle screen
+static splash_mini_t reactive_clawd = {};   // usage-view creature; mood follows the burn rate
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
@@ -243,6 +270,13 @@ static lv_image_dsc_t logo_dsc;
 static lv_image_dsc_t logo_grok_dsc;   // xAI mark, shown on the Grok view
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
+
+// ---- Reset celebration: when the 5h limit refills, briefly take over the
+//      screen with a dancing Clawd + a "Refilled!" banner, then restore. ----
+static lv_obj_t* celebrate_banner = nullptr;
+static uint32_t  celebrate_until_ms = 0;
+static screen_t  celebrate_return_screen = SCREEN_USAGE;
+#define CELEBRATE_MS 4500
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
 // Animation state
@@ -477,8 +511,8 @@ static void build_idle_group(lv_obj_t* parent) {
     // A shrunk-down sleeping creature (reused claudepix "expression sleep" art)
     // sits between the header and the status line; the animated "Listening…"
     // status line carries the words, so no extra text is needed here.
-    lv_obj_t* creature = splash_mini_create(idle_group, "expression sleep", L.idle_px);
-    if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
+    if (splash_mini_init(&idle_creature, idle_group, "expression sleep", L.idle_px))
+        lv_obj_align(idle_creature.canvas, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
 }
@@ -543,6 +577,40 @@ static void init_usage_screen(lv_obj_t* scr) {
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
+    // Reactive Clawd — a small creature in the top-left corner (where the brand
+    // logo sits) whose animation follows the burn rate: dozing when idle, more
+    // animated the harder Claude is being worked. Shown only on the Overview
+    // (the Claude/Grok detail views keep their logos); a child of usage_group so
+    // it hides with the panels on the idle/pairing sub-views.
+    int clawd_px = L.small_icons ? 40 : 80;
+    if (splash_mini_init(&reactive_clawd, usage_group, "expression sleep", clawd_px)) {
+        lv_obj_set_pos(reactive_clawd.canvas, L.margin, L.logo_y);
+        lv_obj_add_flag(reactive_clawd.canvas, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Session sparkline — sits in the session panel between the big % (left) and
+    // the "Current" pill (right), above the bar. Shown only on the Claude view.
+    for (int i = 0; i < SPARK_N; i++) spark_y[i] = LV_CHART_POINT_NONE;
+    int sp_w = L.small_icons ? 74 : 140;
+    int sp_h = L.small_icons ? 22 : 40;
+    int sp_x = L.small_icons ? 62 : 120;
+    spark_chart = lv_chart_create(panel_session);
+    lv_obj_set_size(spark_chart, sp_w, sp_h);
+    lv_obj_set_pos(spark_chart, sp_x, 6);
+    lv_chart_set_type(spark_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(spark_chart, SPARK_N);
+    lv_chart_set_range(spark_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_div_line_count(spark_chart, 0, 0);
+    lv_obj_set_style_bg_opa(spark_chart, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(spark_chart, 0, 0);
+    lv_obj_set_style_pad_all(spark_chart, 0, 0);
+    lv_obj_set_style_size(spark_chart, 0, 0, LV_PART_INDICATOR);   // hide point dots → clean line
+    lv_obj_set_style_line_width(spark_chart, 3, LV_PART_ITEMS);
+    lv_obj_add_flag(spark_chart, LV_OBJ_FLAG_EVENT_BUBBLE);        // let taps toggle the splash
+    spark_ser = lv_chart_add_series(spark_chart, COL_ACCENT, LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_set_ext_y_array(spark_chart, spark_ser, spark_y);
+    lv_obj_add_flag(spark_chart, LV_OBJ_FLAG_HIDDEN);
+
     build_pair_group(usage_container);
     build_idle_group(usage_container);
 
@@ -588,6 +656,38 @@ void ui_init(void) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
     }
+
+    // Reset-celebration banner — created last so it sits on top; shown by
+    // ui_celebrate_reset() over the dancing splash, hidden otherwise.
+    celebrate_banner = lv_label_create(scr);
+    lv_label_set_text(celebrate_banner, "5-hour limit\nrefilled!");
+    lv_obj_set_style_text_font(celebrate_banner, L.pct_font, 0);
+    // Dark pill + accent border + light text so it stays readable over the
+    // orange dancing creature behind it (an orange-on-orange pill washed out).
+    lv_obj_set_style_text_color(celebrate_banner, COL_TEXT, 0);
+    lv_obj_set_style_text_align(celebrate_banner, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(celebrate_banner, COL_BG, 0);
+    lv_obj_set_style_bg_opa(celebrate_banner, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(celebrate_banner, COL_ACCENT, 0);
+    lv_obj_set_style_border_width(celebrate_banner, 3, 0);
+    lv_obj_set_style_radius(celebrate_banner, 16, 0);
+    lv_obj_set_style_pad_all(celebrate_banner, 18, 0);
+    lv_obj_align(celebrate_banner, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Full-screen "you're back!" moment when usage_rate detects the 5h window
+// refilled. Takes over with a dancing Clawd + the banner for CELEBRATE_MS, then
+// ui_tick_anim() restores whatever screen was showing.
+void ui_celebrate_reset(void) {
+    if (!celebrate_banner) return;
+    celebrate_return_screen = (current_screen == SCREEN_SPLASH) ? SCREEN_USAGE : current_screen;
+    splash_play("dance bounce");
+    ui_show_screen(SCREEN_SPLASH);
+    lv_obj_move_foreground(celebrate_banner);
+    lv_obj_clear_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
+    celebrate_until_ms = lv_tick_get() + CELEBRATE_MS;
+    if (celebrate_until_ms == 0) celebrate_until_ms = 1;   // 0 means "not celebrating"
 }
 
 // The usage screen has three views, navigated MANUALLY by the side buttons
@@ -606,6 +706,17 @@ static uint32_t  overview_cycle_last = 0;
 static void render_claude(const UsageData* data);
 static void render_grok(const UsageData* data);
 static void render_overview(const UsageData* data);
+
+// Reactive Clawd's animation for a usage-rate group (0 idle … 3 heavy): the
+// creature dozes when idle and grows livelier the harder Claude is being worked.
+static const char* clawd_anim_for_group(int g) {
+    switch (g) {
+        case 3:  return "dance bounce dj";
+        case 2:  return "dance sway";
+        case 1:  return "idle look around";
+        default: return "expression sleep";
+    }
+}
 
 static void render_current(void) {
     if (!have_usage) return;
@@ -639,6 +750,7 @@ void ui_update(const UsageData* data) {
     data_received = true;
     last_usage = *data;
     have_usage = true;
+    if (!data->enterprise) spark_push((int)(data->session_pct + 0.5f));  // trend of the 5h window
 
     if (data->clock_epoch > 0) {    // daemon supplied wall-clock time → drive the title clock
         clock_base_epoch = data->clock_epoch;
@@ -662,7 +774,14 @@ static void render_claude(const UsageData* data) {
     lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
     lv_image_set_src(logo_img, &logo_dsc);
     lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);   // Overview hides it; restore here
+    if (reactive_clawd.canvas) lv_obj_add_flag(reactive_clawd.canvas, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
+    // Session sparkline lives here (Claude detail); hide it in the enterprise
+    // spending layout, which reuses the panel for the % symbol + budget text.
+    if (spark_chart) {
+        if (data->enterprise) lv_obj_add_flag(spark_chart, LV_OBJ_FLAG_HIDDEN);
+        else                  lv_obj_clear_flag(spark_chart, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (data->enterprise) {
         // Spending box: big number-only label + small "%" symbol + desc + pace
@@ -741,6 +860,8 @@ static void render_grok(const UsageData* data) {
 
     lv_image_set_src(logo_img, &logo_grok_dsc);
     lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);   // Overview hides it; restore here
+    if (reactive_clawd.canvas) lv_obj_add_flag(reactive_clawd.canvas, LV_OBJ_FLAG_HIDDEN);
+    if (spark_chart) lv_obj_add_flag(spark_chart, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_text_color(lbl_anim, COL_DIM, 0);
 
     // Week panel → real weekly-limit %, bar, reset countdown.
@@ -779,6 +900,12 @@ static void render_overview(const UsageData* data) {
     char buf[48];
 
     lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);     // combined view → no single logo
+    // Reactive Clawd takes the corner instead, its mood set by the burn rate.
+    if (reactive_clawd.canvas) {
+        splash_mini_set_anim(&reactive_clawd, clawd_anim_for_group(usage_rate_group()));
+        lv_obj_clear_flag(reactive_clawd.canvas, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (spark_chart) lv_obj_add_flag(spark_chart, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_text_color(lbl_anim, COL_ACCENT, 0);
     lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
     lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
@@ -850,9 +977,23 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
+    // Reset celebration runs on the splash screen, so check its timer before the
+    // usage-screen guard below and restore the prior screen when it elapses.
+    if (celebrate_until_ms && lv_tick_get() >= celebrate_until_ms) {
+        celebrate_until_ms = 0;
+        if (celebrate_banner) lv_obj_add_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
+        ui_show_screen(celebrate_return_screen);
+    }
+
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
-    if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
+    if (view_state == 1) splash_mini_tick_one(&idle_creature);   // sleeping creature on idle
+    // Reactive Clawd animates on the live Overview; keep its mood tracking the
+    // burn rate between renders so it reacts as usage climbs, not only on a flip.
+    if (view_state == 2 && view_idx == VIEW_OVERVIEW && reactive_clawd.canvas) {
+        splash_mini_set_anim(&reactive_clawd, clawd_anim_for_group(usage_rate_group()));
+        splash_mini_tick_one(&reactive_clawd);
+    }
 
     uint32_t now = lv_tick_get();
 

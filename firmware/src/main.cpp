@@ -153,6 +153,8 @@ static bool process_usage_json(const char* json) {
         if (splash_is_active()) splash_pick_for_current_rate();
     }
     ui_update(&usage);
+    // Visual celebration on every 5h refill (chime is separately opt-in above).
+    if (session_reset) ui_celebrate_reset();
     return true;
 }
 
@@ -234,6 +236,7 @@ static void check_serial_cmd() {
             else if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
 #ifdef UI_SHOT
+            else if (strcmp(cmd_buf, "celebrate") == 0) ui_celebrate_reset();
             else if (strncmp(cmd_buf, "shot ", 5) == 0) {
                 int v = 0, m = 0;
                 sscanf(cmd_buf + 5, "%d %d", &v, &m);
@@ -312,6 +315,14 @@ void setup() {
         f.grok_today_pct = 1;  f.grok_today_reset_mins = 182;
         f.grok_week_usd = 89;  f.grok_today_usd = 0;
         f.ok = true; f.valid = true;
+        // Seed the session sparkline with a fake wobbly climb so QA screenshots
+        // show a trend line, not a single point.
+        for (int i = 0; i < 40; i++) {
+            f.session_pct = 25 + i * 1.1f + ((i % 4) - 1.5f) * 5;
+            if (f.session_pct < 0) f.session_pct = 0;
+            ui_update(&f);
+        }
+        f.session_pct = 74;
         ui_update(&f);
     }
     ui_show_screen(SCREEN_USAGE);

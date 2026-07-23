@@ -173,64 +173,71 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
 }
 #endif
 
-// ---- Mini creature: a small animated creature for embedding in other screens
-//      (e.g. the idle "sleeping" indicator). Self-contained — its own canvas and
-//      buffer, independent of the full-screen splash above. ----
-static lv_obj_t  *mini_canvas = NULL;
-static uint16_t  *mini_buf = NULL;
-static int        mini_cell = 0;
-static int        mini_w = 0;
-static const splash_anim_def_t *mini_anim = NULL;
-static uint16_t   mini_frame = 0;
-static uint32_t   mini_started = 0;
+// ---- Mini creature: small animated creatures for embedding in other screens
+//      (idle "sleeping" indicator; reactive Clawd on the usage view). Each
+//      splash_mini_t owns its own canvas + buffer, so several coexist. ----
+static const splash_anim_def_t* find_anim(const char* name) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++)
+        if (strcmp(splash_anims[i].name, name) == 0) return &splash_anims[i];
+    return NULL;
+}
 
-static void mini_render(void) {
-    if (!mini_buf || !mini_anim) return;
-    const uint8_t *cells = mini_anim->frames[mini_frame];
-    const uint16_t *pal = mini_anim->palette;
+static void mini_render_one(splash_mini_t* m) {
+    if (!m->buf || !m->anim) return;
+    const splash_anim_def_t* a = (const splash_anim_def_t*)m->anim;
+    const uint8_t *cells = a->frames[m->frame];
+    const uint16_t *pal = a->palette;
     for (int gy = 0; gy < GRID; gy++) {
         for (int gx = 0; gx < GRID; gx++) {
             uint8_t code = cells[gy * GRID + gx];
             uint16_t color = (pal && code < SPLASH_PALETTE_SIZE) ? pal[code] : COL_EMPTY;
-            for (int dy = 0; dy < mini_cell; dy++) {
-                uint16_t *dst = &mini_buf[(gy * mini_cell + dy) * mini_w + gx * mini_cell];
-                for (int dx = 0; dx < mini_cell; dx++) dst[dx] = color;
+            for (int dy = 0; dy < m->cell; dy++) {
+                uint16_t *dst = &m->buf[(gy * m->cell + dy) * m->w + gx * m->cell];
+                for (int dx = 0; dx < m->cell; dx++) dst[dx] = color;
             }
         }
     }
-    if (mini_canvas) lv_obj_invalidate(mini_canvas);
+    if (m->canvas) lv_obj_invalidate(m->canvas);
 }
 
-lv_obj_t* splash_mini_create(lv_obj_t *parent, const char *anim_name, int px) {
-    mini_anim = NULL;
-    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-        if (strcmp(splash_anims[i].name, anim_name) == 0) { mini_anim = &splash_anims[i]; break; }
-    }
-    if (!mini_anim) return NULL;
-    mini_cell = px / GRID;
-    if (mini_cell < 1) mini_cell = 1;
-    mini_w = GRID * mini_cell;
+bool splash_mini_init(splash_mini_t* m, lv_obj_t *parent, const char *anim_name, int px) {
+    memset(m, 0, sizeof(*m));
+    m->anim = find_anim(anim_name);
+    if (!m->anim) return false;
+    m->cell = px / GRID;
+    if (m->cell < 1) m->cell = 1;
+    m->w = GRID * m->cell;
 #ifdef BOARD_HAS_PSRAM
     const uint32_t caps = MALLOC_CAP_SPIRAM;
 #else
     const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
 #endif
-    mini_buf = (uint16_t*)heap_caps_malloc(mini_w * mini_w * 2, caps);
-    if (!mini_buf) return NULL;
-    mini_canvas = lv_canvas_create(parent);
-    lv_canvas_set_buffer(mini_canvas, mini_buf, mini_w, mini_w, LV_COLOR_FORMAT_RGB565);
-    mini_frame = 0;
-    mini_started = millis();
-    mini_render();
-    return mini_canvas;
+    m->buf = (uint16_t*)heap_caps_malloc(m->w * m->w * 2, caps);
+    if (!m->buf) return false;
+    m->canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(m->canvas, m->buf, m->w, m->w, LV_COLOR_FORMAT_RGB565);
+    m->frame = 0;
+    m->started = millis();
+    mini_render_one(m);
+    return true;
 }
 
-void splash_mini_tick(void) {
-    if (!mini_buf || !mini_anim || mini_anim->frame_count == 0) return;
-    if (millis() - mini_started < mini_anim->holds[mini_frame]) return;
-    mini_started = millis();
-    mini_frame = (mini_frame + 1) % mini_anim->frame_count;
-    mini_render();
+void splash_mini_set_anim(splash_mini_t* m, const char *anim_name) {
+    const splash_anim_def_t* a = find_anim(anim_name);
+    if (!a || a == m->anim) return;   // unknown or unchanged → keep animating current
+    m->anim = a;
+    m->frame = 0;
+    m->started = millis();
+    mini_render_one(m);
+}
+
+void splash_mini_tick_one(splash_mini_t* m) {
+    const splash_anim_def_t* a = (const splash_anim_def_t*)m->anim;
+    if (!m->buf || !a || a->frame_count == 0) return;
+    if (millis() - m->started < a->holds[m->frame]) return;
+    m->started = millis();
+    m->frame = (m->frame + 1) % a->frame_count;
+    mini_render_one(m);
 }
 
 static void show_placeholder() {
@@ -367,6 +374,16 @@ void splash_next(void) {
     const splash_anim_def_t *a = &splash_anims[cur_anim];
     render_frame(a->frames[0], a->palette);
     Serial.printf("splash: -> %s\n", a->name);
+}
+
+void splash_play(const char* anim_name) {
+    const splash_anim_def_t* a = find_anim(anim_name);
+    if (!a) return;
+    cur_anim = (uint16_t)(a - splash_anims);
+    cur_frame = 0;
+    frame_started_ms = millis();
+    last_pick_ms = frame_started_ms;   // hold this animation; don't auto-rotate away
+    render_frame(a->frames[0], a->palette);
 }
 
 void splash_pick_for_current_rate(void) {
