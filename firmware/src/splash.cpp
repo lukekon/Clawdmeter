@@ -376,16 +376,6 @@ void splash_next(void) {
     Serial.printf("splash: -> %s\n", a->name);
 }
 
-void splash_play(const char* anim_name) {
-    const splash_anim_def_t* a = find_anim(anim_name);
-    if (!a) return;
-    cur_anim = (uint16_t)(a - splash_anims);
-    cur_frame = 0;
-    frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;   // hold this animation; don't auto-rotate away
-    render_frame(a->frames[0], a->palette);
-}
-
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
     int g = usage_rate_group();

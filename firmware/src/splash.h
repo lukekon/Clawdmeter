@@ -12,11 +12,6 @@ void splash_tick(void);
 // Cycle to the next animation in the catalog.
 void splash_next(void);
 
-// Jump straight to a named animation (e.g. "dance bounce" for a celebration).
-// No-op if the name isn't in the catalog. Resets the auto-rotate timer so the
-// chosen animation holds rather than being cycled away immediately.
-void splash_play(const char* anim_name);
-
 // Show/hide the splash container.
 void splash_show(void);
 void splash_hide(void);

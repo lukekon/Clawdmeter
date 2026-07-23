@@ -10,7 +10,6 @@ enum screen_t {
 
 void ui_init(void);
 void ui_update(const UsageData* data);
-void ui_celebrate_reset(void);   // 5h limit refilled → brief full-screen dance + banner
 void ui_tick_anim(void);
 void ui_cycle_view(int dir);   // side-button view nav: -1 = prev (left), +1 = next (right)
 #ifdef UI_SHOT

@@ -270,13 +270,6 @@ static lv_image_dsc_t logo_dsc;
 static lv_image_dsc_t logo_grok_dsc;   // xAI mark, shown on the Grok view
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
-
-// ---- Reset celebration: when the 5h limit refills, briefly take over the
-//      screen with a dancing Clawd + a "Refilled!" banner, then restore. ----
-static lv_obj_t* celebrate_banner = nullptr;
-static uint32_t  celebrate_until_ms = 0;
-static screen_t  celebrate_return_screen = SCREEN_USAGE;
-#define CELEBRATE_MS 4500
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
 // Animation state
@@ -656,38 +649,6 @@ void ui_init(void) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
     }
-
-    // Reset-celebration banner — created last so it sits on top; shown by
-    // ui_celebrate_reset() over the dancing splash, hidden otherwise.
-    celebrate_banner = lv_label_create(scr);
-    lv_label_set_text(celebrate_banner, "5-hour limit\nrefilled!");
-    lv_obj_set_style_text_font(celebrate_banner, L.pct_font, 0);
-    // Dark pill + accent border + light text so it stays readable over the
-    // orange dancing creature behind it (an orange-on-orange pill washed out).
-    lv_obj_set_style_text_color(celebrate_banner, COL_TEXT, 0);
-    lv_obj_set_style_text_align(celebrate_banner, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_bg_color(celebrate_banner, COL_BG, 0);
-    lv_obj_set_style_bg_opa(celebrate_banner, LV_OPA_90, 0);
-    lv_obj_set_style_border_color(celebrate_banner, COL_ACCENT, 0);
-    lv_obj_set_style_border_width(celebrate_banner, 3, 0);
-    lv_obj_set_style_radius(celebrate_banner, 16, 0);
-    lv_obj_set_style_pad_all(celebrate_banner, 18, 0);
-    lv_obj_align(celebrate_banner, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
-}
-
-// Full-screen "you're back!" moment when usage_rate detects the 5h window
-// refilled. Takes over with a dancing Clawd + the banner for CELEBRATE_MS, then
-// ui_tick_anim() restores whatever screen was showing.
-void ui_celebrate_reset(void) {
-    if (!celebrate_banner) return;
-    celebrate_return_screen = (current_screen == SCREEN_SPLASH) ? SCREEN_USAGE : current_screen;
-    splash_play("dance bounce");
-    ui_show_screen(SCREEN_SPLASH);
-    lv_obj_move_foreground(celebrate_banner);
-    lv_obj_clear_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
-    celebrate_until_ms = lv_tick_get() + CELEBRATE_MS;
-    if (celebrate_until_ms == 0) celebrate_until_ms = 1;   // 0 means "not celebrating"
 }
 
 // The usage screen has three views, navigated MANUALLY by the side buttons
@@ -977,14 +938,6 @@ static void update_view_state(void) {
 }
 
 void ui_tick_anim(void) {
-    // Reset celebration runs on the splash screen, so check its timer before the
-    // usage-screen guard below and restore the prior screen when it elapses.
-    if (celebrate_until_ms && lv_tick_get() >= celebrate_until_ms) {
-        celebrate_until_ms = 0;
-        if (celebrate_banner) lv_obj_add_flag(celebrate_banner, LV_OBJ_FLAG_HIDDEN);
-        ui_show_screen(celebrate_return_screen);
-    }
-
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick_one(&idle_creature);   // sleeping creature on idle

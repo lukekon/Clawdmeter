@@ -153,8 +153,6 @@ static bool process_usage_json(const char* json) {
         if (splash_is_active()) splash_pick_for_current_rate();
     }
     ui_update(&usage);
-    // Visual celebration on every 5h refill (chime is separately opt-in above).
-    if (session_reset) ui_celebrate_reset();
     return true;
 }
 
@@ -236,7 +234,6 @@ static void check_serial_cmd() {
             else if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
 #ifdef UI_SHOT
-            else if (strcmp(cmd_buf, "celebrate") == 0) ui_celebrate_reset();
             else if (strncmp(cmd_buf, "shot ", 5) == 0) {
                 int v = 0, m = 0;
                 sscanf(cmd_buf + 5, "%d %d", &v, &m);
