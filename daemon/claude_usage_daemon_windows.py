@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import httpx
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
@@ -33,6 +33,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
+SCAN_TIMEOUT = 8.0         # seconds to scan for the advertising device (not-yet-OS-paired)
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -568,16 +569,26 @@ async def acquire_target():
     can't grab a stranger's or the wrong nearby unit. The device must be paired
     with Windows once first (the documented setup). Returns a BLEDevice or None.
     """
-    address = discover_bonded_address()
-    if not address:
-        return None
-    log(f"Not advertising; connecting to bonded address {address}")
-    # CRITICAL: hand BleakClient a BLEDevice, not the bare address string. WinRT's
-    # connect() resolves a bare string via an advertisement scan (find_device_by_address)
-    # — which always fails for a bonded device that has stopped advertising, the very
-    # case we are handling. A BLEDevice sets _device_info directly, so WinRT connects
-    # via from_bluetooth_address_with_bluetooth_address_type_async and skips the scan.
-    return BLEDevice(address, DEVICE_NAME, None)
+    # The Windows "Add device" pairing wizard can't connect to this unit (confirmed:
+    # the device never logs a connection from it), but a direct WinRT connect works.
+    # So we DON'T rely on the OS having paired it — we scan for the advertising device
+    # and let the daemon bond it itself (client.pair() in connect_and_run).
+    address = discover_bonded_address()  # env override, or PnP if it ever is OS-paired
+    try:
+        if address:
+            dev = await BleakScanner.find_device_by_address(address, timeout=SCAN_TIMEOUT)
+        else:
+            dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
+        if dev:
+            log(f"Found {DEVICE_NAME} advertising at {dev.address}")
+            return dev
+    except Exception as e:
+        log(f"Scan for {DEVICE_NAME} failed: {e}")
+    # Fallback: OS-paired device that has stopped advertising — connect by address.
+    if address:
+        log(f"Not advertising; connecting to bonded address {address}")
+        return BLEDevice(address, DEVICE_NAME, None)
+    return None
 
 
 class Session:
@@ -754,16 +765,23 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     # Rebuild a fresh BleakClient each attempt (locked D-05 recipe).
     client = None
     for attempt in range(CONNECT_RETRIES):
-        # D-05: pass BLEDevice (not address string), address_type="random" (NimBLE
-        # static-random), use_cached_services=False (DIY firmware — WinRT GATT cache
-        # may be stale after firmware reflash).
+        # WinRT-backend options MUST be nested under winrt={...} — passing them as
+        # top-level kwargs silently drops them. use_cached_services=False forces a
+        # fresh GATT read (DIY firmware; cache may be stale after a reflash).
         client = BleakClient(
             device,
-            address_type="random",
-            use_cached_services=False,
+            winrt={"use_cached_services": False},
         )
         try:
             await client.connect()
+            # The device requires a bonded+encrypted link for writes, but the Windows
+            # pairing wizard can't reach it. Bond it ourselves over the live connection.
+            # Idempotent: a no-op / benign error if already paired, so we swallow it.
+            try:
+                await client.pair()
+                log("Paired (programmatic)")
+            except Exception as pe:
+                log(f"pair() note: {type(pe).__name__}: {pe}")
         except (BleakError, OSError, asyncio.TimeoutError, AssertionError) as e:
             # WinRT service discovery inside connect() can surface a raw OSError
             # (WinError) or even a bare AssertionError from bleak's FutureLike
