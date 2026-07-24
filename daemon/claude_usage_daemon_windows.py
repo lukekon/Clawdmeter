@@ -348,15 +348,6 @@ ANTHROPIC_RATES = [
 ]
 # BY MODEL bar order must match proto's colours (Opus, Sonnet, Haiku, Fable).
 CLAUDE_FAMILIES = ["opus", "sonnet", "haiku", "fable"]
-# model id → short "IN USE" label. Longest/most-specific prefix first.
-CLAUDE_LABELS = [
-    ("claude-opus-4-8",  "OPUS 4.8"),
-    ("claude-opus-4",    "OPUS 4"),
-    ("claude-sonnet-5",  "SONNET 5"),
-    ("claude-sonnet",    "SONNET"),
-    ("claude-haiku-4-5", "HAIKU 4.5"),
-    ("claude-fable-5",   "FABLE 5"),
-]
 CLAUDE_RECOMPUTE_S = 300
 _claude_cache: dict = {"ts": 0.0}
 
@@ -369,9 +360,24 @@ def _claude_family(model: str) -> str:
 
 
 def _claude_label(model: str) -> str:
-    for prefix, label in CLAUDE_LABELS:
-        if model.startswith(prefix):
-            return label
+    """Short "IN USE" label from a model id, derived — not hardcoded, so new
+    models Just Work. "claude-opus-5" → "OPUS 5", "claude-opus-4-8" → "OPUS 4.8".
+    Never shows the "CLAUDE-" prefix (the Claude view already says it's Claude):
+    the family is the first token, the ≤2-digit tokens after it are the version
+    (a trailing YYYYMMDD snapshot date is dropped). Raw id if it doesn't parse."""
+    m = model.lower()
+    if m.startswith("claude-"):
+        m = m[len("claude-"):]
+    parts = m.split("-")
+    if parts and parts[0].isalpha():
+        fam = parts[0].upper()
+        vers = []
+        for p in parts[1:]:
+            if p.isdigit() and len(p) <= 2:   # a version segment, not a date
+                vers.append(p)
+            else:
+                break
+        return (fam + " " + ".".join(vers)).strip()
     return model[:12].upper()
 
 
