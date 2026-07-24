@@ -1,6 +1,40 @@
 #pragma once
 #include <Arduino.h>
 
+// Machine vitals from PitCrew's telemetry engine (via the daemon). Every field
+// is best-effort: a *_valid flag false means "no reading" and the proto view
+// falls back to its placeholder / shows an honest null rather than a fake number.
+struct Vitals {
+    bool valid;              // any of cpu/gpu/ram present in the payload
+    // CPU
+    bool cpu_valid;
+    int  cpu_pct;
+    char cpu_name[28];
+    int  cpu_clk_mhz;
+    bool cpu_temp_valid;     // desktops rarely expose a package temp → often false
+    int  cpu_temp_c;
+    int  cores[24];          // per-core load %
+    int  ncores;
+    // GPU (absent when no discrete GPU present)
+    bool  gpu_valid;
+    int   gpu_pct;
+    char  gpu_name[28];
+    bool  gpu_temp_valid;
+    int   gpu_temp_c;
+    float gpu_power_w;
+    int   gpu_power_limit_w;
+    int   gpu_vram_used_mb;
+    int   gpu_vram_total_mb;
+    // RAM
+    bool      ram_valid;
+    int       ram_pct;
+    long long ram_used_bytes;
+    long long ram_total_bytes;
+    // Top memory-consuming processes — segments of the used block on the RAM view.
+    int       ram_nseg;
+    struct { char name[14]; long long bytes; } ram_segs[4];
+};
+
 struct UsageData {
     float session_pct;       // utilization 0-100 (5h window Pro/Max; spending % Enterprise)
     int session_reset_mins;  // minutes until reset
@@ -23,6 +57,23 @@ struct UsageData {
     float grok_today_pct;    // % of that weekly limit consumed today (Grok has no daily limit)
     int grok_week_reset_mins;  // minutes until the weekly limit resets (-1 = unknown)
     int grok_today_reset_mins; // minutes until local midnight ("today" resets there)
+    bool grok_series_valid;      // "gx" present → 7-day Grok $ series available
+    float grok_week_series[7];   // 7-day daily $ activity (index 6 = today)
+    // Claude's model-scoped weekly limit (the "Weekly Fable"/"Weekly Opus" wall) —
+    // NOT in the Messages-API headers; read from /api/oauth/usage. Absent → hide it.
+    bool scoped_weekly_valid;
+    float scoped_weekly_pct;
+    int scoped_weekly_reset_mins;
+    char scoped_weekly_model[16]; // driving model's display name (e.g. "Fable")
+    // Claude Code transcript activity (the CLAUDE view extras). $ is at API rates —
+    // an activity gauge, not a bill (flat-rate subscription).
+    bool claude_extras_valid;
+    float claude_today_usd;
+    int  claude_nmodels;         // models in use right now (parallel sessions)
+    char claude_models[3][16];   // e.g. {"OPUS 4.8","FABLE 5"}, most-recent first
+    float claude_by[4];          // today's $ split: [Opus, Sonnet, Haiku, Fable]
+    float claude_week[7];        // 7-day daily $ series (index 6 = today)
+    Vitals vitals;               // CPU / GPU / RAM machine telemetry
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };

@@ -130,6 +130,66 @@ static bool parse_json(const char* json, UsageData* out) {
     out->grok_today_pct = doc["gdp"] | 0.0f;  // % of that limit used today
     out->grok_week_reset_mins = doc["gwr"] | -1;
     out->grok_today_reset_mins = doc["gdr"] | -1;
+    // Grok 7-day $ series for the sparkline ("gx":{"wk":[...]}).
+    out->grok_series_valid = !doc["gx"].isNull();
+    for (int i = 0; i < 7; i++) out->grok_week_series[i] = doc["gx"]["wk"][i] | 0.0f;
+
+    // Claude model-scoped weekly limit (Weekly-Fable/Opus) — absent → device hides it.
+    out->scoped_weekly_valid = !doc["kw"].isNull();
+    out->scoped_weekly_pct = doc["kw"] | 0.0f;
+    out->scoped_weekly_reset_mins = doc["kwr"] | -1;
+    strlcpy(out->scoped_weekly_model, doc["kwm"] | "", sizeof(out->scoped_weekly_model));
+
+    // Claude Code transcript extras ("cx": spend / model / by-model / 7-day).
+    out->claude_extras_valid = !doc["cx"].isNull();
+    out->claude_today_usd = doc["cx"]["sp"] | 0.0f;
+    out->claude_nmodels = 0;
+    for (JsonVariantConst mv : doc["cx"]["mu"].as<JsonArrayConst>()) {
+        if (out->claude_nmodels >= 3) break;
+        strlcpy(out->claude_models[out->claude_nmodels], mv | "", 16);
+        out->claude_nmodels++;
+    }
+    for (int i = 0; i < 4; i++) out->claude_by[i]   = doc["cx"]["by"][i] | 0.0f;
+    for (int i = 0; i < 7; i++) out->claude_week[i]  = doc["cx"]["wk"][i] | 0.0f;
+
+    // Machine vitals ("cpu"/"gpu"/"ram"). Each block optional; *_valid gates it.
+    Vitals& v = out->vitals;
+    JsonVariantConst cpu = doc["cpu"];
+    v.cpu_valid = !cpu.isNull();
+    v.cpu_pct = cpu["p"] | 0;
+    strlcpy(v.cpu_name, cpu["n"] | "", sizeof(v.cpu_name));
+    v.cpu_clk_mhz = cpu["clk"] | 0;
+    v.cpu_temp_valid = v.cpu_valid && !cpu["t"].isNull();
+    v.cpu_temp_c = cpu["t"] | 0;
+    v.ncores = 0;
+    for (JsonVariantConst c : cpu["c"].as<JsonArrayConst>()) {
+        if (v.ncores >= 24) break;
+        v.cores[v.ncores++] = c | 0;
+    }
+    JsonVariantConst gpu = doc["gpu"];
+    v.gpu_valid = !gpu.isNull();
+    v.gpu_pct = gpu["p"] | 0;
+    strlcpy(v.gpu_name, gpu["n"] | "", sizeof(v.gpu_name));
+    v.gpu_temp_valid = v.gpu_valid && !gpu["t"].isNull();
+    v.gpu_temp_c = gpu["t"] | 0;
+    v.gpu_power_w = gpu["pw"] | 0.0f;
+    v.gpu_power_limit_w = gpu["pl"] | 0;
+    v.gpu_vram_used_mb = gpu["vu"] | 0;
+    v.gpu_vram_total_mb = gpu["vt"] | 0;
+    JsonVariantConst ram = doc["ram"];
+    v.ram_valid = !ram.isNull();
+    v.ram_pct = ram["p"] | 0;
+    v.ram_used_bytes = ram["u"] | 0LL;
+    v.ram_total_bytes = ram["tot"] | 0LL;
+    v.ram_nseg = 0;
+    for (JsonVariantConst sg : ram["seg"].as<JsonArrayConst>()) {
+        if (v.ram_nseg >= 4) break;
+        strlcpy(v.ram_segs[v.ram_nseg].name, sg["n"] | "", sizeof(v.ram_segs[0].name));
+        v.ram_segs[v.ram_nseg].bytes = sg["b"] | 0LL;
+        v.ram_nseg++;
+    }
+    v.valid = v.cpu_valid || v.gpu_valid || v.ram_valid;
+
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -140,6 +200,14 @@ static bool parse_json(const char* json, UsageData* out) {
 // unreliable) the USB-serial data link. Returns false if the JSON didn't parse.
 static bool process_usage_json(const char* json) {
     if (!parse_json(json, &usage)) return false;
+#ifdef PITCREW_PROTO
+    // The proto owns the whole screen and has none of the normal UI's widgets
+    // (ui_init early-returns in proto mode). Feed the proto and skip the rate/
+    // splash/ui_update plumbing entirely — touching those uncreated widgets
+    // (e.g. via ui_show_screen) stack-overflows the loop task.
+    proto_update(&usage);
+    return true;
+#else
     int g_before = usage_rate_group();
     bool session_reset = usage_rate_sample(usage.session_pct);
     int g_after = usage_rate_group();
@@ -157,13 +225,17 @@ static bool process_usage_json(const char* json) {
     }
     ui_update(&usage);
     return true;
+#endif
 }
 
 // ---- Serial command buffer ----
 // Sized to hold a full usage JSON payload: on desktops where BLE won't stay
 // connected, the daemon streams the same JSON over USB serial (a line starting
 // with '{') instead of writing the BLE RX characteristic.
-#define CMD_BUF_SIZE 512
+// Phase B adds vitals (per-core array + device names) + the three Claude limits +
+// Grok/Claude 7-day series to the payload — a full line runs ~620 B, so the 512 B
+// that held the base payload is no longer enough. 1024 leaves comfortable headroom.
+#define CMD_BUF_SIZE 1024
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -222,13 +294,17 @@ static void check_serial_cmd() {
                 // Usage payload over USB serial — transport-equivalent to a BLE
                 // RX write. No owner/encryption checks: the cable is the link.
                 bool first = !serial_link_ever;
+                (void)first;
                 if (process_usage_json(cmd_buf)) {
                     serial_link_ever = true;
+#ifndef PITCREW_PROTO
                     // Show "connected" off the cable and, on the very first
                     // payload, surface the usage screen so a reflash visibly lands.
+                    // Skipped in proto: it owns the screen and has no such widgets.
                     ui_update_ble_status(BLE_STATE_CONNECTED, "USB", "serial");
                     if (first && ui_get_current_screen() == SCREEN_SPLASH)
                         ui_show_screen(SCREEN_USAGE);
+#endif
                     Serial.println("{\"ack\":true}");
                 } else {
                     Serial.println("{\"err\":true}");
@@ -260,6 +336,11 @@ static void check_serial_cmd() {
 extern "C" void board_init(void);
 
 void setup() {
+    // Phase B's payload grew to ~600-1000 B (vitals + three Claude limits + series).
+    // The USB-CDC RX ring defaults to 256 B, so a single daemon write() of the full
+    // line overran it and dropped bytes → truncated JSON ("IncompleteInput"). Enlarge
+    // the ring (must be set before begin) so the whole line is buffered in one burst.
+    Serial.setRxBufferSize(2048);
     Serial.begin(115200);
     delay(300);
     Serial.println("{\"ready\":true}");

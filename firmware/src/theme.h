@@ -42,7 +42,9 @@
 // Provider + model identity (AI views only)
 #define PC_CLAUDE   lv_color_hex(0xd97757)   // Anthropic coral — all Claude gauges
 #define PC_GROK     lv_color_hex(0x2b4fe0)   // deep royal blue — all Grok gauges
-#define PC_OPUS     PC_CLAUDE                // flagship = brand coral
-#define PC_SONNET   lv_color_hex(0xe7c547)   // gold
-#define PC_HAIKU    lv_color_hex(0x8c8c86)   // grey
-#define PC_FABLE    lv_color_hex(0x7a6ce4)   // violet
+// Model chips/segments — one violet family (near Fable), spaced enough to read
+// apart. Rings no longer use these (they're heat-tiered); these are model identity.
+#define PC_OPUS     lv_color_hex(0x8b5cf6)   // vivid violet (flagship)
+#define PC_SONNET   lv_color_hex(0x4f5bd6)   // indigo / blue-violet
+#define PC_HAIKU    lv_color_hex(0xb9a3e8)   // pale lavender
+#define PC_FABLE    lv_color_hex(0x7a6ce4)   // mid violet

@@ -1,11 +1,25 @@
 #include "proto.h"
 #include "theme.h"
 #include "dither.h"
+#include "data.h"
+#include "splash.h"
+#include "logo_grok_lobe.h"
 #include "hal/board_caps.h"
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <cmath>
+
+// Init an lv_image_dsc for an RGB565A8 asset (w*h RGB565 LE + w*h alpha).
+static void proto_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint8_t* data) {
+    dsc->header.w = w;
+    dsc->header.h = h;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565A8;
+    dsc->header.stride = w * 2;
+    dsc->data = data;
+    dsc->data_size = w * h * 3;
+}
 
 // Departure Mono (tabular numerics, full °/—) + Styrene (letter-spaced eyebrows).
 // Departure is generated into firmware/src; grammar matches PitCrew web.
@@ -16,6 +30,8 @@ LV_FONT_DECLARE(font_departure_20);
 LV_FONT_DECLARE(font_styrene_20);
 LV_FONT_DECLARE(font_styrene_16);
 LV_FONT_DECLARE(font_styrene_14);
+LV_FONT_DECLARE(font_styrene_12);
+LV_FONT_DECLARE(font_styrene_10);  // smallest — RESETS + IN USE ("much smaller")
 
 // ── Views ───────────────────────────────────────────────────────────────────
 enum { PV_SYS = 0, PV_CPU, PV_GPU, PV_RAM, PV_CLAUDE, PV_GROK, PV_COUNT };
@@ -50,6 +66,63 @@ static const float MODEL_SPLIT[4] = { 0.22f, 0.15f, 0.08f, 0.55f };
 // 7-day series (normalised 0..1 of daily ceiling).
 static const float WEEK_CLAUDE[7] = { 0.42f, 0.61f, 0.35f, 0.88f, 0.55f, 0.70f, 0.73f };
 static const float WEEK_GROK[7]   = { 0.12f, 0.18f, 0.09f, 0.28f, 0.15f, 0.22f, 0.21f };
+
+// ── Live data (Phase B) ──────────────────────────────────────────────────────
+// proto_update() stashes the latest payload; the views read through the accessors
+// below, which fall back to the placeholder constants above whenever a field is
+// absent (no daemon yet / partial payload) so screenshot QA still renders.
+static UsageData s_d;
+static bool      s_has = false;
+
+static bool hcpu() { return s_has && s_d.vitals.cpu_valid; }
+static bool hgpu() { return s_has && s_d.vitals.gpu_valid; }
+static bool hram() { return s_has && s_d.vitals.ram_valid; }
+static bool hcl()  { return s_has && s_d.valid; }
+
+static float cpu_pct() { return hcpu() ? (float)s_d.vitals.cpu_pct : CPU_PCT; }
+static float gpu_pct() { return hgpu() ? (float)s_d.vitals.gpu_pct : GPU_PCT; }
+static float ram_pct() { return hram() ? (float)s_d.vitals.ram_pct : RAM_PCT; }
+
+static float cl_session()   { return hcl() ? s_d.session_pct : CLAUDE_SESSION; }
+static float cl_weekly()    { return hcl() ? s_d.weekly_pct  : CLAUDE_WEEKLY; }
+static bool  cl_scoped_ok() { return hcl() && s_d.scoped_weekly_valid; }
+static float cl_scoped()    { return cl_scoped_ok() ? s_d.scoped_weekly_pct : CLAUDE_FABLE; }
+static float grok_pct()     { return hcl() ? s_d.grok_week_pct : GROK_WEEKLY; }
+
+// model display name → its identity hue (one violet family: Opus/Sonnet/Haiku/Fable
+// spaced across the spectrum · Grok red); default to the Claude coral.
+static lv_color_t model_color(const char* m) {
+    if (strstr(m, "OPUS"))   return PC_OPUS;
+    if (strstr(m, "SONNET")) return PC_SONNET;
+    if (strstr(m, "HAIKU"))  return PC_HAIKU;
+    if (strstr(m, "FABLE"))  return PC_FABLE;
+    if (strstr(m, "GROK"))   return PC_GROK;
+    return PC_CLAUDE;
+}
+
+// mins → compact "45M" / "3H" / "4D" (em-dash when unknown).
+static void fmt_dur(char* b, size_t n, int mins) {
+    if (mins < 0)         snprintf(b, n, "\xE2\x80\x94");
+    else if (mins < 60)   snprintf(b, n, "%dM", mins);
+    else if (mins < 1440) snprintf(b, n, "%dH", (mins + 30) / 60);
+    else                  snprintf(b, n, "%dD", (mins + 720) / 1440);
+}
+
+static void upcpy(char* dst, size_t n, const char* src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < n; i++) dst[i] = (char)toupper((unsigned char)src[i]);
+    dst[i] = 0;
+}
+
+// Normalise a 7-sample $ series to 0..1 by its max into out[7]; returns out, or
+// nullptr when the series is empty/all-zero (caller uses the placeholder then).
+static const float* norm7(const float* src, float* out) {
+    float mx = 0.0f;
+    for (int i = 0; i < 7; i++) if (src[i] > mx) mx = src[i];
+    if (mx <= 0.0f) return nullptr;
+    for (int i = 0; i < 7; i++) out[i] = src[i] / mx;
+    return out;
+}
 
 // Grok keeps a roomier single-gauge rhythm (Claude is denser — own layout).
 enum {
@@ -124,6 +197,9 @@ static int       s_njobs = 0;
 static float     s_reveal = 1.0f;
 static float     s_live   = 1.0f;
 static lv_timer_t* s_pulse = nullptr;
+// Header mascot (Claude view) — ticked by the pulse timer so it animates.
+static splash_mini_t s_mascot   = {};
+static bool          s_mascot_on = false;
 
 static void free_bufs() {
     for (int i = 0; i < s_nbuf; i++) heap_caps_free(s_bufs[i]);
@@ -225,6 +301,8 @@ static void pulse_cb(lv_timer_t* /*t*/) {
         s_jobs[i].live_alpha = s_live;
         paint_job(&s_jobs[i], s_reveal);
     }
+    // Advance the header mascot (Claude view) at its own animation pace.
+    if (s_mascot_on) splash_mini_tick_one(&s_mascot);
 }
 
 static void start_motion() {
@@ -372,20 +450,6 @@ static void job_arc(lv_obj_t* scr, int x, int y, int as, float frac,
     paint_job(j, 0);
 }
 
-// Model-in-use tag with square LED in the active model's colour.
-static void model_tag(lv_obj_t* scr, const char* label, lv_color_t led_col, int y) {
-    lv_obj_t* tag = crow(scr, y, 8);
-    lv_obj_t* led = lv_obj_create(tag);
-    lv_obj_set_size(led, 8, 8);
-    lv_obj_set_style_bg_color(led, led_col, 0);
-    lv_obj_set_style_bg_opa(led, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(led, 0, 0);
-    lv_obj_set_style_border_width(led, 0, 0);
-    lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* m = rtext(tag, label, PC_DIM, &font_styrene_14);
-    lv_obj_set_style_text_letter_space(m, 3, 0);
-}
-
 // ── Chrome: view name + page dots only (no fake LIVE) ───────────────────────
 
 static void chrome(lv_obj_t* scr, const char* name) {
@@ -393,12 +457,15 @@ static void chrome(lv_obj_t* scr, const char* name) {
     lv_obj_set_style_bg_color(scr, PC_BG, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    lv_obj_t* hdr = lv_label_create(scr);
-    lv_label_set_text(hdr, name);
-    lv_obj_set_style_text_font(hdr, &font_styrene_16, 0);
-    lv_obj_set_style_text_color(hdr, PC_DIM, 0);
-    lv_obj_set_style_text_letter_space(hdr, 4, 0);
-    lv_obj_set_pos(hdr, 28, 24);
+    // name == nullptr → the view draws its own header mark (mascot / logo).
+    if (name) {
+        lv_obj_t* hdr = lv_label_create(scr);
+        lv_label_set_text(hdr, name);
+        lv_obj_set_style_text_font(hdr, &font_styrene_16, 0);
+        lv_obj_set_style_text_color(hdr, PC_DIM, 0);
+        lv_obj_set_style_text_letter_space(hdr, 4, 0);
+        lv_obj_set_pos(hdr, 28, 24);
+    }
 
     const int n = PV_COUNT, dot = 6, gap = 12;
     const int total = n * dot + (n - 1) * gap;
@@ -456,9 +523,9 @@ static void view_sys(lv_obj_t* scr) {
 
     struct Row { const char* name; float pct; };
     Row rows[] = {
-        { "CPU", CPU_PCT },
-        { "GPU", GPU_PCT },
-        { "RAM", RAM_PCT },
+        { "CPU", cpu_pct() },
+        { "GPU", gpu_pct() },
+        { "RAM", ram_pct() },
     };
 
     // 3 rows with generous black air. pitch 110: y=90/200/310, meters end ~330.
@@ -491,31 +558,47 @@ static void view_sys(lv_obj_t* scr) {
 static void view_cpu(lv_obj_t* scr) {
     chrome(scr, "CPU");
     eyebrow_c(scr, "LOAD", PC_DIM, &font_styrene_16, 56);
-    hero_pct(scr, (int)(CPU_PCT + 0.5f), 86, &font_departure_72);
-    dep_c(scr, "AMD RYZEN 9 5900X", PC_DIM, &font_departure_20, 172);
+    hero_pct(scr, (int)(cpu_pct() + 0.5f), 86, &font_departure_72);
+    dep_c(scr, (hcpu() && s_d.vitals.cpu_name[0]) ? s_d.vitals.cpu_name
+                                                  : "AMD Ryzen 9 5900X",
+          PC_DIM, &font_departure_20, 172);
 
-    // 12-core columns — each core band-colored by its own load.
+    // Per-core columns — each core band-colored by its own load. Live cores when
+    // present (up to 24 threads on this box), else the 12-thread mock.
     const int W = board_caps().width;
     const int cw = W - 56, ch = 140;
+    const float* cores = (hcpu() && s_d.vitals.ncores > 0) ? nullptr : CORES;
+    const int    ncores = (hcpu() && s_d.vitals.ncores > 0) ? s_d.vitals.ncores : NCORES;
     uint16_t* b = mkbuf(cw, ch);
     PaintJob* j = add_job();
     if (j && b) {
         j->kind = PK_COLUMNS;
         j->buf = b; j->w = cw; j->h = ch; j->cell = 2;
-        j->n = NCORES;
+        j->n = ncores > 16 ? 16 : ncores;   // PaintJob holds up to 16 columns
         j->max_v = 1.0f;
-        for (int i = 0; i < NCORES; i++) {
-            j->vals[i] = CORES[i];
-            j->colors[i] = band(CORES[i] * 100.0f);
+        for (int i = 0; i < j->n; i++) {
+            float load = cores ? cores[i] : (s_d.vitals.cores[i] / 100.0f);
+            j->vals[i] = load;
+            j->colors[i] = band(load * 100.0f);
         }
         j->canvas = canvas_at(scr, b, cw, ch, 28, 220);
         paint_job(j, 0);
     }
 
     eyebrow_c(scr, "PER CORE", PC_DIM, &font_styrene_14, 372);
-    // Honest null for temp — Departure has em-dash.
-    dep_c(scr, "TEMP  \xE2\x80\x94  no sensor", PC_GREY, &font_departure_20, 400);
-    dep_c(scr, "4.35 GHz", PC_TEXT, &font_departure_20, 428);
+    // Real package temp when the box exposes one; honest null otherwise.
+    if (hcpu() && s_d.vitals.cpu_temp_valid) {
+        char t[24];
+        snprintf(t, sizeof t, "TEMP  %d\xC2\xB0""C", s_d.vitals.cpu_temp_c);
+        dep_c(scr, t, PC_TEXT, &font_departure_20, 400);
+    } else {
+        dep_c(scr, "TEMP  \xE2\x80\x94  no sensor", PC_GREY, &font_departure_20, 400);
+    }
+    char clk[16];
+    float ghz = (hcpu() && s_d.vitals.cpu_clk_mhz > 0) ? s_d.vitals.cpu_clk_mhz / 1000.0f
+                                                       : 4.35f;
+    snprintf(clk, sizeof clk, "%.2f GHz", ghz);
+    dep_c(scr, clk, PC_TEXT, &font_departure_20, 428);
 }
 
 // GPU — DitherRadial (load cycle) + VRAM capacity meter.
@@ -525,13 +608,14 @@ static void view_gpu(lv_obj_t* scr) {
     const int AS = 220, ay = 52;
     int ax = (W - AS) / 2;
 
+    const float gp = gpu_pct();
     uint16_t* b = mkbuf(AS, AS);
     PaintJob* j = add_job();
     if (j && b) {
         j->kind = PK_ARC;
         j->buf = b; j->w = AS; j->h = AS; j->cell = 2;
-        j->f = GPU_PCT / 100.0f;
-        j->color = band(GPU_PCT);
+        j->f = gp / 100.0f;
+        j->color = band(gp);
         j->thick = 22;
         j->use_bands = true;  // track pre-shows heat thresholds
         j->canvas = canvas_at(scr, b, AS, AS, ax, ay);
@@ -539,15 +623,34 @@ static void view_gpu(lv_obj_t* scr) {
     }
 
     eyebrow_c(scr, "LOAD", PC_DIM, &font_styrene_16, ay + 72);
-    hero_pct(scr, (int)(GPU_PCT + 0.5f), ay + 100, &font_departure_48);
+    hero_pct(scr, (int)(gp + 0.5f), ay + 100, &font_departure_48);
 
     hairline(scr, 292, 72, W - 72);
-    eyebrow_c(scr, "NVIDIA RTX 3080 Ti", PC_DIM, &font_styrene_16, 308);
-    // Departure has ° — real glyph.
-    dep_c(scr, "71\xC2\xB0""C  \xC2\xB7  214 W", PC_TEXT, &font_departure_32, 340);
+    eyebrow_c(scr, (hgpu() && s_d.vitals.gpu_name[0]) ? s_d.vitals.gpu_name
+                                                      : "NVIDIA RTX 3080 Ti",
+              PC_DIM, &font_styrene_16, 308);
+    // "<temp>°C · <power> W" — em-dash for temp when the GPU reports none.
+    char line[32];
+    if (hgpu()) {
+        if (s_d.vitals.gpu_temp_valid)
+            snprintf(line, sizeof line, "%d\xC2\xB0""C  \xC2\xB7  %d W",
+                     s_d.vitals.gpu_temp_c, (int)(s_d.vitals.gpu_power_w + 0.5f));
+        else
+            snprintf(line, sizeof line, "\xE2\x80\x94  \xC2\xB7  %d W",
+                     (int)(s_d.vitals.gpu_power_w + 0.5f));
+    } else {
+        snprintf(line, sizeof line, "71\xC2\xB0""C  \xC2\xB7  214 W");
+    }
+    dep_c(scr, line, PC_TEXT, &font_departure_32, 340);
 
-    eyebrow_c(scr, "VRAM  9.1 / 12 GB", PC_DIM, &font_styrene_14, 388);
-    float vram = 9.1f / 12.0f;
+    // VRAM used / total — real MB → GB.
+    float vu_gb = hgpu() ? s_d.vitals.gpu_vram_used_mb  / 1024.0f : 9.1f;
+    float vt_gb = hgpu() ? s_d.vitals.gpu_vram_total_mb / 1024.0f : 12.0f;
+    if (vt_gb <= 0) vt_gb = 12.0f;
+    char vram_lbl[28];
+    snprintf(vram_lbl, sizeof vram_lbl, "VRAM  %.1f / %.0f GB", vu_gb, vt_gb);
+    eyebrow_c(scr, vram_lbl, PC_DIM, &font_styrene_14, 388);
+    float vram = vu_gb / vt_gb;
     job_meter(scr, 40, 418, W - 80, 18, vram, band(vram * 100.0f));
 }
 
@@ -555,8 +658,18 @@ static void view_gpu(lv_obj_t* scr) {
 static void view_ram(lv_obj_t* scr) {
     chrome(scr, "RAM");
     eyebrow_c(scr, "IN USE", PC_DIM, &font_styrene_16, 52);
-    hero_pct(scr, (int)(RAM_PCT + 0.5f), 80, &font_departure_72);
-    dep_c(scr, "18.2 / 32 GB", PC_TEXT, &font_departure_32, 168);
+    hero_pct(scr, (int)(ram_pct() + 0.5f), 80, &font_departure_72);
+
+    const float GB = 1073741824.0f;
+    float used_gb  = hram() ? s_d.vitals.ram_used_bytes  / GB : 18.2f;
+    float total_gb = hram() ? s_d.vitals.ram_total_bytes / GB : 32.0f;
+    if (total_gb <= 0) total_gb = 32.0f;
+    float free_gb = total_gb - used_gb;
+    if (free_gb < 0) free_gb = 0;
+
+    char ut[24];
+    snprintf(ut, sizeof ut, "%.1f / %.0f GB", used_gb, total_gb);
+    dep_c(scr, ut, PC_TEXT, &font_departure_32, 168);
 
     const int W = board_caps().width;
     const int tw = W - 48, th = 168;
@@ -565,20 +678,46 @@ static void view_ram(lv_obj_t* scr) {
     if (j && b) {
         j->kind = PK_TREEMAP;
         j->buf = b; j->w = tw; j->h = th; j->cell = 2;
-        // Used categories — distinct treemap palette hues (not heat-banded).
-        // Free is ghost; dither_treemap pins it to the right edge.
-        j->tiles[0] = { 7.5f,  PC_BLUE,   false };  // Apps
-        j->tiles[1] = { 4.0f,  PC_ORANGE, false };  // System
-        j->tiles[2] = { 4.2f,  PC_YELLOW, false };  // Cached
-        j->tiles[3] = { 2.5f,  PC_GREEN,  false };  // Buffers
-        j->tiles[4] = { 13.8f, PC_GREY,   true  };  // Free → right strip
-        j->ntiles = 5;
+        if (hram() && s_d.vitals.ram_nseg > 0) {
+            // Real segments = the top memory-consuming processes, then whatever
+            // else is used, then the FREE ghost strip. Honest and subdivided.
+            lv_color_t pal[4] = { PC_BLUE, PC_YELLOW, PC_GREEN, PC_ORANGE };
+            int n = s_d.vitals.ram_nseg;
+            float seg_sum = 0.0f;
+            for (int i = 0; i < n; i++) {
+                float gb = s_d.vitals.ram_segs[i].bytes / GB;
+                j->tiles[i] = { gb, pal[i % 4], false };
+                seg_sum += gb;
+            }
+            j->ntiles = n;
+            float other = used_gb - seg_sum;
+            if (other > 0.05f) j->tiles[j->ntiles++] = { other, PC_HAIKU, false };
+            j->tiles[j->ntiles++] = { free_gb, PC_GREY, true };  // Free → right strip
+        } else if (hram()) {
+            // No per-process data — honest used tile + FREE ghost.
+            j->tiles[0] = { used_gb, PC_BLUE, false };
+            j->tiles[1] = { free_gb, PC_GREY, true  };
+            j->ntiles = 2;
+        } else {
+            // No daemon — the approved multi-hue mock (placeholder categories).
+            j->tiles[0] = { 7.5f,  PC_BLUE,   false };
+            j->tiles[1] = { 4.0f,  PC_ORANGE, false };
+            j->tiles[2] = { 4.2f,  PC_YELLOW, false };
+            j->tiles[3] = { 2.5f,  PC_GREEN,  false };
+            j->tiles[4] = { 13.8f, PC_GREY,   true  };
+            j->ntiles = 5;
+        }
         j->canvas = canvas_at(scr, b, tw, th, 24, 220);
         paint_job(j, 0);
     }
 
-    eyebrow_c(scr, "APPS  SYSTEM  CACHED  BUFFERS  FREE", PC_DIM, &font_styrene_14, 400);
-    dep_c(scr, "AVAILABLE  13.8 GB", PC_TEXT, &font_departure_20, 424);
+    const char* ram_legend = (hram() && s_d.vitals.ram_nseg > 0) ? "TOP PROCESSES  \xC2\xB7  FREE"
+                             : hram()                             ? "IN USE  \xC2\xB7  FREE"
+                             : "APPS  SYSTEM  CACHED  BUFFERS  FREE";
+    eyebrow_c(scr, ram_legend, PC_DIM, &font_styrene_14, 400);
+    char avail[28];
+    snprintf(avail, sizeof avail, "AVAILABLE  %.1f GB", free_gb);
+    dep_c(scr, avail, PC_TEXT, &font_departure_20, 424);
 }
 
 // Column-centered eyebrow (for dual-arc labels).
@@ -592,10 +731,89 @@ static void brow_col(lv_obj_t* scr, const char* t, int cx, int y) {
     lv_obj_set_pos(e, cx - lv_obj_get_width(e) / 2, y);
 }
 
-// CLAUDE — three limits (session + weekly arcs, Weekly Fable bar) + BY MODEL + footer.
-// Dense on purpose: arcs shrunk to ~158px so Fable limit + model bar both fit with air.
+// ── Header marks (replace the text header on the AI views) ───────────────────
+static void header_mascot(lv_obj_t* scr) {
+    if (splash_mini_init(&s_mascot, scr, "idle look around", 40)) {
+        lv_obj_set_pos(s_mascot.canvas, 22, 12);
+        if (s_nbuf < 16) s_bufs[s_nbuf++] = s_mascot.buf;  // free_bufs reclaims it each render
+        s_mascot_on = true;  // the pulse timer now animates it
+    }
+}
+
+static void header_grok_logo(lv_obj_t* scr) {
+    static lv_image_dsc_t dsc;
+    proto_icon_dsc(&dsc, GROK_LOGO_LOBE_WIDTH, GROK_LOGO_LOBE_HEIGHT, grok_logo_lobe_data);
+    lv_obj_t* img = lv_image_create(scr);
+    lv_image_set_src(img, &dsc);
+    lv_obj_set_pos(img, 24, 14);
+}
+
+// A model identity chip: colour square + name, packed tight (its own sub-row).
+static lv_obj_t* model_chip(lv_obj_t* parent, const char* name, lv_color_t col,
+                            int sq, const lv_font_t* font) {
+    lv_obj_t* c = lv_obj_create(parent);
+    lv_obj_remove_style_all(c);
+    lv_obj_set_size(c, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(c, 4, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* led = lv_obj_create(c);
+    lv_obj_set_size(led, sq, sq);
+    lv_obj_set_style_bg_color(led, col, 0);
+    lv_obj_set_style_bg_opa(led, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(led, 0, 0);
+    lv_obj_set_style_border_width(led, 0, 0);
+    lv_obj_clear_flag(led, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* l = rtext(c, name, PC_DIM, font);
+    lv_obj_set_style_text_letter_space(l, 2, 0);
+    return c;
+}
+
+// "IN USE" + one chip per model running now (parallel sessions → several chips).
+static void inuse_chips(lv_obj_t* scr, int y) {
+    lv_obj_t* row = crow(scr, y, 9);
+    lv_obj_t* lbl = rtext(row, "IN USE", PC_DIM, &font_styrene_10);
+    lv_obj_set_style_text_letter_space(lbl, 2, 0);
+    if (hcl() && s_d.claude_nmodels > 0) {
+        for (int i = 0; i < s_d.claude_nmodels; i++)
+            model_chip(row, s_d.claude_models[i], model_color(s_d.claude_models[i]), 6, &font_styrene_10);
+    } else if (!hcl()) {
+        model_chip(row, "OPUS 4.8", PC_OPUS, 6, &font_styrene_10);
+        model_chip(row, "FABLE 5",  PC_FABLE, 6, &font_styrene_10);
+    } else {
+        rtext(row, "\xE2\x80\x94", PC_GREY, &font_styrene_16);  // idle: nothing recent
+    }
+}
+
+// Small "RESETS <dur>" centred under a ring column.
+static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
+    char d[8], b[16];
+    fmt_dur(d, sizeof d, mins);
+    snprintf(b, sizeof b, "RESETS %s", d);
+    lv_obj_t* l = lv_label_create(scr);
+    lv_label_set_text(l, b);
+    lv_obj_set_style_text_font(l, &font_styrene_10, 0);
+    lv_obj_set_style_text_color(l, PC_DIM, 0);
+    lv_obj_set_style_text_letter_space(l, 1, 0);
+    lv_obj_update_layout(l);
+    lv_obj_set_pos(l, cx - lv_obj_get_width(l) / 2, y);
+}
+
+// BY MODEL colour legend so the proportion bar is readable.
+static void bymodel_legend(lv_obj_t* scr, int y) {
+    lv_obj_t* row = crow(scr, y, 12);
+    model_chip(row, "OPUS",   PC_OPUS,   7, &font_styrene_14);
+    model_chip(row, "SONNET", PC_SONNET, 7, &font_styrene_14);
+    model_chip(row, "HAIKU",  PC_HAIKU,  7, &font_styrene_14);
+    model_chip(row, "FABLE",  PC_FABLE,  7, &font_styrene_14);
+}
+
+// CLAUDE — three limits (heat-tiered Session/Weekly rings + Weekly-Fable bar),
+// resets under each ring, models-in-use chips, BY MODEL bar+legend, spend, spark.
 static void view_claude(lv_obj_t* scr) {
-    chrome(scr, "CLAUDE");
+    chrome(scr, nullptr);
+    header_mascot(scr);
     const int W = board_caps().width;
     const int mx = 28;
     const int mw = W - 56;
@@ -607,23 +825,36 @@ static void view_claude(lv_obj_t* scr) {
     const int xL = x0, xR = x0 + AS + gap;
     const int cxL = xL + AS / 2, cxR = xR + AS / 2;
 
-    job_arc(scr, xL, ay, AS, CLAUDE_SESSION / 100.0f, PC_CLAUDE, 14, false);
-    job_arc(scr, xR, ay, AS, CLAUDE_WEEKLY  / 100.0f, PC_CLAUDE, 14, false);
-    brow_col(scr, "SESSION", cxL, ay + 48);
-    brow_col(scr, "WEEKLY",  cxR, ay + 48);
-    // Secondary Departure size so the pair doesn't dominate the denser stack.
-    pct_col(scr, (int)(CLAUDE_SESSION + 0.5f), cxL, ay + 74, &font_departure_20);
-    pct_col(scr, (int)(CLAUDE_WEEKLY  + 0.5f), cxR, ay + 74, &font_departure_20);
+    // Rings are heat-tiered by % now (green→yellow→orange→red), not brand coral.
+    const float sp = cl_session(), wp = cl_weekly();
+    job_arc(scr, xL, ay, AS, sp / 100.0f, band(sp), 14, false);
+    job_arc(scr, xR, ay, AS, wp / 100.0f, band(wp), 14, false);
+    brow_col(scr, "SESSION", cxL, ay + 46);
+    brow_col(scr, "WEEKLY",  cxR, ay + 46);
+    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 70, &font_departure_20);
+    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 70, &font_departure_20);
+    // Each ring's reset, small, directly beneath it.
+    reset_col(scr, hcl() ? s_d.session_reset_mins : 63, cxL, ay + 98);
+    reset_col(scr, hcl() ? (s_d.scoped_weekly_valid ? s_d.scoped_weekly_reset_mins
+                                                     : s_d.weekly_reset_mins)
+                         : 7000, cxR, ay + 98);
 
-    // ── In-use tag ──────────────────────────────────────────────────────────
-    model_tag(scr, "IN USE  OPUS 4.8", PC_OPUS, 208);
+    // ── Models in use right now (one chip each — supports parallel sessions) ──
+    inuse_chips(scr, 196);
 
-    // ── Weekly Fable LIMIT (cap fullness — not share-of-usage) ───────────────
-    // 92% is near the wall: orange fill + bright readout.
-    {
-        const float fp = CLAUDE_FABLE;
+    // ── Model-scoped weekly LIMIT (Weekly-Fable/Opus — cap fullness) ─────────
+    // Drawn when a scoped weekly is active (or in placeholder/QA mode). When live
+    // data says there is none, the slot is left empty rather than faking a wall.
+    if (!hcl() || s_d.scoped_weekly_valid) {
+        const float fp = cl_scoped();
         lv_color_t fcol = limit_fill(fp);
-        eyebrow_at(scr, "WEEKLY FABLE", PC_DIM, &font_styrene_14, mx, 234);
+        char flabel[20] = "WEEKLY FABLE";
+        if (hcl() && s_d.scoped_weekly_model[0]) {
+            char mup[14];
+            upcpy(mup, sizeof mup, s_d.scoped_weekly_model);
+            snprintf(flabel, sizeof flabel, "WEEKLY %s", mup);
+        }
+        eyebrow_at(scr, flabel, PC_DIM, &font_styrene_14, mx, 226);
 
         char num[8];
         snprintf(num, sizeof num, "%d", (int)(fp + 0.5f));
@@ -634,18 +865,29 @@ static void view_claude(lv_obj_t* scr) {
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(row, 3, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_align(row, LV_ALIGN_TOP_RIGHT, -mx, 230);
+        lv_obj_align(row, LV_ALIGN_TOP_RIGHT, -mx, 222);
         // Heavier readout colour when urgent.
         rtext(row, num, fcol, &font_departure_20);
         rtext(row, "%", fcol, &font_styrene_14);
 
-        job_meter(scr, mx, 256, mw, 12, fp / 100.0f, fcol);
+        job_meter(scr, mx, 248, mw, 12, fp / 100.0f, fcol);
     }
 
-    // ── BY MODEL proportion (usage share — distinct from the Fable *limit*) ─
-    eyebrow_at(scr, "BY MODEL", PC_DIM, &font_styrene_14, mx, 280);
+    // ── BY MODEL proportion (today's usage share — distinct from the *limit*) ─
+    eyebrow_at(scr, "BY MODEL", PC_DIM, &font_styrene_14, mx, 272);
     {
         lv_color_t mc[4] = { PC_OPUS, PC_SONNET, PC_HAIKU, PC_FABLE };
+        // Normalise real per-model $ to fractions; fall back to the mock split.
+        float split[4];
+        const float* src = MODEL_SPLIT;
+        if (hcl() && s_d.claude_extras_valid) {
+            float sum = 0.0f;
+            for (int i = 0; i < 4; i++) sum += s_d.claude_by[i];
+            if (sum > 0.0f) {
+                for (int i = 0; i < 4; i++) split[i] = s_d.claude_by[i] / sum;
+                src = split;
+            }
+        }
         uint16_t* mb = mkbuf(mw, 12);
         PaintJob* mj = add_job();
         if (mj && mb) {
@@ -653,45 +895,66 @@ static void view_claude(lv_obj_t* scr) {
             mj->buf = mb; mj->w = mw; mj->h = 12; mj->cell = 2;
             mj->n = 4;
             for (int i = 0; i < 4; i++) {
-                mj->vals[i] = MODEL_SPLIT[i];
+                mj->vals[i] = src[i];
                 mj->colors[i] = mc[i];
             }
             mj->total = 1.0f;
-            mj->canvas = canvas_at(scr, mb, mw, 12, mx, 302);
+            mj->canvas = canvas_at(scr, mb, mw, 12, mx, 292);
             paint_job(mj, 0);
         }
     }
+    bymodel_legend(scr, 310);
 
-    // ── Spend / resets / spark (tightened footer) ───────────────────────────
-    dep_c(scr, "$4.35", PC_TEXT, &font_departure_20, 328);
-    eyebrow_c(scr, "TODAY", PC_DIM, &font_styrene_14, 352);
-    // Session resets soon; weekly + fable share the 4d window.
-    dep_c(scr, "RESETS  1H  \xC2\xB7  4D", PC_DIM, &font_departure_20, 372);
-    eyebrow_c(scr, "7 DAY", PC_DIM, &font_styrene_14, 396);
-    job_spark(scr, mx, 416, mw, 24, WEEK_CLAUDE, 7, PC_CLAUDE);
+    // ── Spend + 7-day spark (neutral line — no coral; resets now live under the rings) ─
+    char spend[16] = "$4.35";
+    if (hcl() && s_d.claude_extras_valid)
+        snprintf(spend, sizeof spend, "$%.2f", s_d.claude_today_usd);
+    dep_c(scr, spend, PC_TEXT, &font_departure_20, 336);
+    eyebrow_c(scr, "TODAY", PC_DIM, &font_styrene_14, 360);
+    eyebrow_c(scr, "7 DAY", PC_DIM, &font_styrene_14, 382);
+    float sk[7];
+    const float* claude_sk = (hcl() && s_d.claude_extras_valid) ? norm7(s_d.claude_week, sk)
+                                                                : nullptr;
+    job_spark(scr, mx, 400, mw, 22, claude_sk ? claude_sk : WEEK_CLAUDE, 7, lv_color_hex(0x9298a2));
 }
 
 // GROK — roomy single weekly radial (deep blue); hypothetical API-rate activity $.
 static void view_grok(lv_obj_t* scr) {
-    chrome(scr, "GROK");
+    chrome(scr, nullptr);
+    header_grok_logo(scr);
     const int W = board_caps().width;
     const int AS = AI_GAUGE_AS, ay = AI_GAUGE_Y;
     const int ax = (W - AS) / 2;
     const int cx = ax + AS / 2;
 
-    job_arc(scr, ax, ay, AS, GROK_WEEKLY / 100.0f, PC_GROK, 16, false);
-    brow_col(scr, "WEEKLY", cx, ay + 58);
-    pct_col(scr, (int)(GROK_WEEKLY + 0.5f), cx, ay + 88, &font_departure_32);
+    // Ring heat-tiered by %. Inner stack uses the SAME fonts + spacing rhythm as
+    // the Claude rings (WEEKLY / dep-20 % / small RESETS), centred in the ring.
+    const float gw = grok_pct();
+    job_arc(scr, ax, ay, AS, gw / 100.0f, band(gw), 16, false);
+    brow_col(scr, "WEEKLY", cx, ay + 60);
+    pct_col(scr, (int)(gw + 0.5f), cx, ay + 84, &font_departure_20);
+    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 112);
 
-    model_tag(scr, "IN USE  GROK 4.5", PC_GROK, AI_TAG_Y);
+    // IN USE — same size/style as the Claude view (styrene_10 + small chip).
+    {
+        lv_obj_t* row = crow(scr, 246, 9);
+        lv_obj_t* lbl = rtext(row, "IN USE", PC_DIM, &font_styrene_10);
+        lv_obj_set_style_text_letter_space(lbl, 2, 0);
+        model_chip(row, "GROK 4.5", PC_GROK, 6, &font_styrene_10);
+    }
 
-    // Hypothetical-at-API-rates activity (flat-rate sub ⇒ real bill ~$0). Non-zero
-    // so the mock doesn't read as "unused."
-    dep_c(scr, "$18.60", PC_TEXT, &font_departure_32, AI_SPEND_Y);
-    eyebrow_c(scr, "TODAY", PC_DIM, &font_styrene_14, AI_TODAY_Y);
-    dep_c(scr, "RESETS  4D 11H", PC_DIM, &font_departure_20, AI_RESET_Y);
-    eyebrow_c(scr, "7 DAY", PC_DIM, &font_styrene_14, AI_7DAY_Y);
-    job_spark(scr, 32, AI_SPARK_Y, W - 64, AI_SPARK_H, WEEK_GROK, 7, PC_GROK);
+    // Hypothetical-at-API-rates activity (flat-rate sub ⇒ real bill ~$0), see
+    // [[ai-subscriptions]]. Pulled up — Grok has no usage-limit bars, so the
+    // footer would otherwise sag below a big empty gap.
+    char spend[16] = "$18.60";
+    if (hcl()) snprintf(spend, sizeof spend, "$%.2f", s_d.grok_today_usd);
+    dep_c(scr, spend, PC_TEXT, &font_departure_32, 296);
+    eyebrow_c(scr, "TODAY", PC_DIM, &font_styrene_14, 334);
+    eyebrow_c(scr, "7 DAY", PC_DIM, &font_styrene_14, 366);
+    float sk[7];
+    const float* grok_sk = (hcl() && s_d.grok_series_valid) ? norm7(s_d.grok_week_series, sk)
+                                                            : nullptr;
+    job_spark(scr, 32, 386, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -700,6 +963,10 @@ void proto_render(lv_obj_t* scr) {
     s_scr = scr;
     lv_anim_delete(&s_anim_var, reveal_exec);
     if (s_pulse) { lv_timer_delete(s_pulse); s_pulse = nullptr; }
+
+    // Mascot canvas/buffer are about to be freed; stop ticking until a view that
+    // draws it (Claude) re-inits it. Prevents ticking a freed buffer on other views.
+    s_mascot_on = false;
 
     lv_obj_clean(scr);
     free_bufs();
@@ -725,4 +992,11 @@ void proto_set_view(int v) {
     if (!s_scr) return;
     s_view = ((v % PV_COUNT) + PV_COUNT) % PV_COUNT;
     proto_render(s_scr);
+}
+
+void proto_update(const UsageData* data) {
+    if (!data || !data->valid) return;
+    s_d = *data;
+    s_has = true;
+    if (s_scr) proto_render(s_scr);   // re-render the current view from live data
 }

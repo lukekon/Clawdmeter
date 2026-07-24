@@ -15,6 +15,7 @@ import logging.handlers
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -72,7 +73,8 @@ XAI_RATES = [
     ("grok-4.3", (1.25, 2.5, 0.2)),
 ]
 GROK_RECOMPUTE_S = 300  # a desk gauge needn't be fresher than this; keeps the scan cheap
-_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "wpct": 0, "dpct": 0, "wreset": -1}
+_grok_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "wpct": 0, "dpct": 0,
+               "wreset": -1, "daily": [0.0] * 7}
 # The % bars come from xAI's OWN weekly limit, not a made-up $ budget. The Grok CLI
 # logs every billing refresh to unified.jsonl ("billing: fetched credits config" →
 # creditUsagePercent) — the exact number it prints as "Weekly limit: N%". We read that
@@ -91,7 +93,7 @@ def _grok_cost(model: str, fresh: int, output: int, cached: int) -> float:
     return 0.0
 
 
-def _recompute_grok() -> tuple[float, float]:
+def _recompute_grok() -> tuple[float, float, list]:
     """Scan the local Grok logs for this week's and today's xAI $ activity.
 
     Two sources, same as PitCrew: the Grok CLI (~/.grok/sessions/*/*/updates.jsonl,
@@ -105,6 +107,7 @@ def _recompute_grok() -> tuple[float, float]:
     lt = time.localtime(now)
     today_cut = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
     week = today = 0.0
+    daily = [0.0] * 7  # index 6 = today, 0 = 6 days ago (the 7-day sparkline)
 
     def add(cost: float, ts: float) -> None:
         nonlocal week, today
@@ -114,6 +117,9 @@ def _recompute_grok() -> tuple[float, float]:
             week += cost
         if ts >= today_cut:
             today += cost
+        idx = 6 + int((ts - today_cut) // 86400)
+        if 0 <= idx < 7:
+            daily[idx] += cost
 
     # Grok CLI — turn_completed carries a modelUsage map; timestamp is unix seconds.
     try:
@@ -167,7 +173,7 @@ def _recompute_grok() -> tuple[float, float]:
         except (OSError, ValueError):
             continue
 
-    return week, today
+    return week, today, daily
 
 
 def _iso_to_epoch(s) -> float | None:
@@ -251,9 +257,9 @@ async def fetch_grok_usage() -> dict:
     try:
         now = time.time()
         if now - _grok_cache["ts"] >= GROK_RECOMPUTE_S:
-            week, today = _recompute_grok()
+            week, today, daily = _recompute_grok()
             wpct, dpct, wreset = read_grok_limit()
-            _grok_cache.update(ts=now, week=week, today=today,
+            _grok_cache.update(ts=now, week=week, today=today, daily=daily,
                                wpct=wpct, dpct=dpct, wreset=wreset)
         return {
             "g": round(_grok_cache["week"]),
@@ -262,10 +268,302 @@ async def fetch_grok_usage() -> dict:
             "gdp": _grok_cache["dpct"],
             "gwr": _grok_cache["wreset"],   # weekly-limit reset (mins)
             "gdr": _mins_until_midnight(),  # today's reset = local midnight (mins)
+            # 7-day $ activity series for the GROK view sparkline (index 6 = today).
+            "gx": {"wk": [round(x, 4) for x in _grok_cache["daily"]]},
         }
     except Exception as e:
         log(f"Grok usage compute failed: {e}")
         return {}
+
+
+# --- Claude model-scoped weekly limit (Weekly-Fable / Weekly-Opus) ----------
+# The Messages-API rate-limit headers expose ONLY the all-models 5h + 7d limits.
+# The separate heavy-model weekly cap (the "Weekly Fable" 92% wall Luke sees on
+# claude.ai) is NOT in those headers — a Fable/Opus request just 429s with no
+# rate-limit headers at all. It IS available from /api/oauth/usage, the same
+# endpoint Claude Code's own `/usage` panel reads, via a read-only GET with the
+# OAuth token. `limits[]` carries one entry per limit; the model-scoped weekly is
+# kind="weekly_scoped" and names its driving model (dynamic — Fable now, could be
+# Opus another week), so the device label follows it honestly.
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+async def fetch_scoped_weekly(token: str) -> dict:
+    """The most-binding active model-scoped weekly limit as {kw, kwr, kwm}, or {}
+    when there is none / on any failure. Best-effort: a hiccup here must never
+    block the Claude display (the 5h/7d limits come from poll_api regardless)."""
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.5",
+        "Authorization": f"Bearer {token}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.get(CLAUDE_USAGE_URL, headers=headers)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log(f"scoped-weekly read failed: {e}")
+        return {}
+    except Exception as e:  # a usage-endpoint hiccup must never touch the Claude path
+        log(f"scoped-weekly read error: {e}")
+        return {}
+    limits = data.get("limits") or []
+    scoped = [l for l in limits
+              if l.get("kind") == "weekly_scoped" and (l.get("percent") or 0) > 0]
+    if not scoped:
+        return {}
+    scoped.sort(key=lambda l: l.get("percent") or 0, reverse=True)
+    top = scoped[0]
+    model = ((top.get("scope") or {}).get("model") or {}).get("display_name") or "WEEKLY"
+    return {
+        "kw": int(round(top.get("percent") or 0)),
+        "kwr": _mins_until(_iso_to_epoch(top.get("resets_at"))),
+        "kwm": str(model)[:12],
+    }
+
+
+# --- Claude Code transcript activity ($ spend, model split, in-use model) ----
+# Mirrors PitCrew's ingestClaudeTranscripts()/estCost() (lib/usage.ts,
+# usage-rates.ts) so the device agrees with the AI Usage tab, but self-computes
+# here so nothing but this daemon has to be running. $ figures are "at API rates"
+# — an activity gauge, not a bill (subscription is flat-rate; see [[ai-subscriptions]]).
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+# $ per 1M tokens (input, output, cacheRead, cacheWrite5m, cacheWrite1h). Anthropic
+# only. Unlike Grok, cache_read is a SEPARATE field from input (not a subset), so no
+# subtraction. Claude Code writes the 1h cache tier. Longest prefix first.
+ANTHROPIC_RATES = [
+    ("claude-fable-5",   (10.0, 50.0, 1.0,  12.5, 20.0)),
+    ("claude-opus-4",    (5.0,  25.0, 0.5,  6.25, 10.0)),
+    ("claude-sonnet",    (3.0,  15.0, 0.3,  3.75, 6.0)),
+    ("claude-haiku-4-5", (1.0,  5.0,  0.1,  1.25, 2.0)),
+]
+# BY MODEL bar order must match proto's colours (Opus, Sonnet, Haiku, Fable).
+CLAUDE_FAMILIES = ["opus", "sonnet", "haiku", "fable"]
+# model id → short "IN USE" label. Longest/most-specific prefix first.
+CLAUDE_LABELS = [
+    ("claude-opus-4-8",  "OPUS 4.8"),
+    ("claude-opus-4",    "OPUS 4"),
+    ("claude-sonnet-5",  "SONNET 5"),
+    ("claude-sonnet",    "SONNET"),
+    ("claude-haiku-4-5", "HAIKU 4.5"),
+    ("claude-fable-5",   "FABLE 5"),
+]
+CLAUDE_RECOMPUTE_S = 300
+_claude_cache: dict = {"ts": 0.0}
+
+
+def _claude_family(model: str) -> str:
+    for fam in CLAUDE_FAMILIES:
+        if fam in model:
+            return fam
+    return "other"
+
+
+def _claude_label(model: str) -> str:
+    for prefix, label in CLAUDE_LABELS:
+        if model.startswith(prefix):
+            return label
+    return model[:12].upper()
+
+
+def _claude_cost(model: str, t: tuple) -> float:
+    for prefix, (ci, co, cr, c5, c1) in ANTHROPIC_RATES:
+        if model.startswith(prefix):
+            return (t[0] * ci + t[1] * co + t[2] * cr + t[3] * c5 + t[4] * c1) / 1_000_000.0
+    return 0.0
+
+
+def _claude_tokens(u: dict) -> tuple:
+    """(input, output, cacheRead, cacheWrite5m, cacheWrite1h) from an Anthropic usage
+    blob. Uses the 5m/1h split when present, else buckets the aggregate as 5m."""
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        w5 = cc.get("ephemeral_5m_input_tokens") or 0
+        w1 = cc.get("ephemeral_1h_input_tokens") or 0
+    else:
+        w5 = u.get("cache_creation_input_tokens") or 0
+        w1 = 0
+    return (u.get("input_tokens") or 0, u.get("output_tokens") or 0,
+            u.get("cache_read_input_tokens") or 0, w5, w1)
+
+
+def _recompute_claude() -> dict:
+    """Scan ~/.claude/projects/**/*.jsonl for this week's Claude Code activity.
+    One API response spans several JSONL lines sharing a message id, so dedupe by
+    id. Returns today/week $, the per-family today split, a 7-day daily-$ series
+    (index 6 = today), and the most-recent model in use."""
+    now = time.time()
+    week_cut = now - 7 * 86400
+    lt = time.localtime(now)
+    today_cut = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    week = today = 0.0
+    by_family = {f: 0.0 for f in CLAUDE_FAMILIES}
+    daily = [0.0] * 7
+    seen: set = set()
+    recent_cut = now - 600  # a model with a turn in the last 10 min = "in use"
+    recent: dict = {}       # model label -> its latest ts within the window
+    try:
+        files = list(CLAUDE_PROJECTS.glob("**/*.jsonl"))
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            if f.stat().st_mtime < week_cut:
+                continue
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    # cheap pre-filter before JSON.parse — most lines aren't turns
+                    if '"type":"assistant"' not in line or '"usage"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "assistant":
+                        continue
+                    msg = rec.get("message") or {}
+                    usage = msg.get("usage")
+                    model = msg.get("model")
+                    if not usage or not model or model == "<synthetic>":
+                        continue
+                    mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+                    ts = _iso_to_epoch(rec.get("timestamp"))
+                    if not mid or ts is None or mid in seen:
+                        continue
+                    seen.add(mid)
+                    cost = _claude_cost(model, _claude_tokens(usage))
+                    if ts >= week_cut:
+                        week += cost
+                    if ts >= today_cut:
+                        today += cost
+                        by_family[_claude_family(model)] = \
+                            by_family.get(_claude_family(model), 0.0) + cost
+                    idx = 6 + int((ts - today_cut) // 86400)
+                    if 0 <= idx < 7:
+                        daily[idx] += cost
+                    if ts >= recent_cut:
+                        lbl = _claude_label(model)
+                        if ts > recent.get(lbl, 0.0):
+                            recent[lbl] = ts
+        except OSError:
+            continue
+    # Models in use right now, most-recent first (parallel sessions → several).
+    models = [lbl for lbl, _ in sorted(recent.items(), key=lambda kv: kv[1], reverse=True)][:3]
+    return {
+        "week": week,
+        "today": today,
+        "by": [round(by_family.get(f, 0.0), 4) for f in CLAUDE_FAMILIES],
+        "daily": [round(x, 4) for x in daily],
+        "models": models,
+    }
+
+
+def fetch_claude_extras() -> dict:
+    """CLAUDE view extras nested under "cx", cached CLAUDE_RECOMPUTE_S:
+      sp = today's $ activity   m = model in use   by = [opus,sonnet,haiku,fable] $
+      wk = 7-day daily $ series (index 6 = today)
+    Best-effort → {} on any failure so the three real limits are never affected."""
+    try:
+        now = time.time()
+        if now - _claude_cache["ts"] >= CLAUDE_RECOMPUTE_S:
+            _claude_cache.update(ts=now, **_recompute_claude())
+        return {"cx": {
+            "sp": round(_claude_cache.get("today", 0.0), 2),
+            "mu": _claude_cache.get("models", []),
+            "by": _claude_cache.get("by", [0, 0, 0, 0]),
+            "wk": _claude_cache.get("daily", [0] * 7),
+        }}
+    except Exception as e:
+        log(f"Claude extras compute failed: {e}")
+        return {}
+
+
+# --- Machine vitals via PitCrew's telemetry engine --------------------------
+# scan-telemetry.ps1 is pure PowerShell (CIM + registry + nvidia-smi), standalone
+# — no PitCrew server needed. The daemon runs it directly so vitals work whenever
+# the daemon runs (the PitCrew web app is usually closed). Override the repo dir
+# with CLAWDMETER_PITCREW_DIR; a missing script / non-Windows box just drops the
+# vitals views rather than inventing numbers.
+PITCREW_DIR = Path(os.environ.get("CLAWDMETER_PITCREW_DIR", Path.home() / "pitcrew"))
+TELEMETRY_SCRIPT = PITCREW_DIR / "engine" / "scan-telemetry.ps1"
+VITALS_RECOMPUTE_S = 30  # vitals refresh; full (non-Lite) scan adds ~1s for top procs
+_vitals_cache: dict = {"ts": 0.0, "data": {}}
+
+
+def _run_telemetry() -> dict:
+    """Run scan-telemetry.ps1 (full, for the RAM top-process segments) and reshape
+    its JSON into the compact vitals the device shows. {} on any failure (honest —
+    a missing feed drops the view)."""
+    if sys.platform != "win32" or not TELEMETRY_SCRIPT.exists():
+        return {}
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File", str(TELEMETRY_SCRIPT)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return {}
+        d = json.loads(proc.stdout).get("data") or {}
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        log(f"vitals scan failed: {e}")
+        return {}
+    cpu = d.get("cpu") or {}
+    gpu = d.get("gpu") or {}
+    ram = d.get("ram") or {}
+    # Trim marketing suffixes so the short device font shows the useful part
+    # ("AMD Ryzen 9 5900X", "NVIDIA RTX 3080 Ti") instead of a mid-word cut.
+    cpu_name = re.sub(r"\s*\d+-Core Processor.*$", "", cpu.get("name") or "", flags=re.I)
+    cpu_name = re.sub(r"\s*(Processor|CPU)\s*$", "", cpu_name, flags=re.I)
+    cpu_name = cpu_name.replace("(R)", "").replace("(TM)", "").strip()
+    gpu_name = (gpu.get("name") or "").replace("GeForce ", "").strip()
+    out: dict = {
+        "cpu": {
+            "p": cpu.get("usagePct"),
+            "n": cpu_name[:24],
+            "clk": cpu.get("currentClockMHz"),
+            "t": cpu.get("tempC"),                       # null → device shows "no sensor"
+            "c": [int(x) for x in (cpu.get("perCore") or [])[:24]],
+        },
+        "ram": {
+            "p": ram.get("pct"),
+            "u": ram.get("usedBytes"),
+            "tot": ram.get("totalBytes"),
+        },
+    }
+    # Top memory-consuming processes → real segments for the RAM treemap (honest
+    # subdivision of the used block; telemetry can't split it any other way).
+    top_ram = ((d.get("top") or {}).get("ram")) or []
+    segs = []
+    for p in top_ram[:4]:
+        b = p.get("bytes") or 0
+        if b > 0:
+            segs.append({"n": (p.get("name") or "")[:12], "b": int(b)})
+    if segs:
+        out["ram"]["seg"] = segs
+    if gpu.get("present"):
+        out["gpu"] = {
+            "p": gpu.get("utilizationPct"),
+            "n": gpu_name[:24],
+            "t": gpu.get("tempC"),
+            "pw": gpu.get("powerDrawW"),
+            "pl": gpu.get("powerLimitW"),
+            "vu": gpu.get("memUsedMB"),
+            "vt": gpu.get("memTotalMB"),
+        }
+    return out
+
+
+def read_vitals() -> dict:
+    """Cached machine vitals for the payload ({cpu,ram[,gpu]}), or {} when the
+    telemetry feed is unavailable so the device degrades to honest nulls."""
+    now = time.time()
+    if now - _vitals_cache["ts"] >= VITALS_RECOMPUTE_S:
+        _vitals_cache.update(ts=now, data=_run_telemetry())
+    return _vitals_cache["data"]
 
 
 def _build_file_logger() -> logging.Logger | None:
@@ -682,6 +980,16 @@ async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
         # already logged it; do NOT toast "token expired" (that mislabeled a
         # boot-time DNS blip as an auth problem, SC#5). Next poll retries.
         return
+    # Phase-B real data — the model-scoped weekly limit (Fable/Opus), Claude
+    # transcript activity, and machine vitals. All best-effort and merged here
+    # (not in poll_api) so the proven 5h/7d + Grok path is untouched; any failure
+    # returns {} and simply omits those fields rather than blocking the send.
+    try:
+        payload.update(await fetch_scoped_weekly(token))
+        payload.update(fetch_claude_extras())
+        payload.update(read_vitals())
+    except Exception as e:
+        log(f"payload augment failed: {e}")
     write_payload(ser, payload)   # raises serial.SerialException/OSError on a dead port
     if tray_state:
         tray_state.set_connected(time.time())
