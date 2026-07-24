@@ -385,7 +385,9 @@ static void hero_pct(lv_obj_t* scr, int pct, int y, const lv_font_t* num_font) {
     lv_obj_set_style_text_letter_space(u, 0, 0);
 }
 
-// % readout centered on column at (cx, y) — for dual-arc Claude gauges.
+// % readout with the NUMERAL centred on cx (the "%" hangs to the right, so the
+// number itself reads as centred in the ring — centring the whole row instead
+// pushes the number off to the left).
 static void pct_col(lv_obj_t* scr, int pct, int cx, int y, const lv_font_t* num_font) {
     char num[8];
     snprintf(num, sizeof num, "%d", pct);
@@ -396,11 +398,11 @@ static void pct_col(lv_obj_t* scr, int pct, int cx, int y, const lv_font_t* num_
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(row, 6, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    rtext(row, num, PC_TEXT, num_font);
+    lv_obj_t* nl = rtext(row, num, PC_TEXT, num_font);
     lv_obj_t* u = rtext(row, "%", PC_DIM, &font_styrene_24);
     lv_obj_set_style_text_letter_space(u, 0, 0);
     lv_obj_update_layout(row);
-    lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y);
+    lv_obj_set_pos(row, cx - lv_obj_get_width(nl) / 2, y);
 }
 
 // One radial gauge job at (x,y).
@@ -837,15 +839,16 @@ static void view_claude(lv_obj_t* scr) {
     const float sp = cl_session(), wp = cl_weekly();
     job_arc(scr, xL, ay, AS, sp / 100.0f, band(sp), 18, false);
     job_arc(scr, xR, ay, AS, wp / 100.0f, band(wp), 18, false);
-    // Inner stack: % on top (centred on the ring), label under it, reset tucked
-    // into the open 6-o'clock gap. The clock row is narrower than the arc's two
-    // descending ends, so it clears them.
-    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 72, &font_departure_48);
-    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 72, &font_departure_48);
-    brow_col(scr, "SESSION", cxL, ay + 126);
-    brow_col(scr, "WEEKLY",  cxR, ay + 126);
-    reset_col(scr, hcl() ? s_d.session_reset_mins : 63,   cxL, ay + 158);
-    reset_col(scr, hcl() ? s_d.weekly_reset_mins  : 7000, cxR, ay + 158);
+    // Inner stack: % on top, label under it, reset tucked into the open 6-o'clock
+    // gap. The stack sits HIGH — the ring's inner opening narrows fast below the
+    // midline, so "SESSION" (the widest label) must stay near centre or the arc
+    // clips its ends. % centred just above the midline keeps the label at ~dy30.
+    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 58, &font_departure_48);
+    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 58, &font_departure_48);
+    brow_col(scr, "SESSION", cxL, ay + 110);
+    brow_col(scr, "WEEKLY",  cxR, ay + 110);
+    reset_col(scr, hcl() ? s_d.session_reset_mins : 63,   cxL, ay + 140);
+    reset_col(scr, hcl() ? s_d.weekly_reset_mins  : 7000, cxR, ay + 140);
 
     // ── Footer (identical rhythm to view_grok) ───────────────────────────────
     inuse_chips(scr, 300);
@@ -878,9 +881,9 @@ static void view_grok(lv_obj_t* scr) {
     // Grok has just one limit), WEEKLY under it, reset tucked into the open bottom.
     const float gw = grok_pct();
     job_arc(scr, ax, ay, AS, gw / 100.0f, band(gw), 20, false);
-    pct_col(scr, (int)(gw + 0.5f), cx, ay + 76, &font_departure_72);
-    brow_col(scr, "WEEKLY", cx, ay + 156);
-    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 188);
+    pct_col(scr, (int)(gw + 0.5f), cx, ay + 72, &font_departure_72);
+    brow_col(scr, "WEEKLY", cx, ay + 150);
+    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 184);
 
     // IN USE — same size/style as the Claude view.
     {
