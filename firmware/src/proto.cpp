@@ -714,12 +714,12 @@ static void brow_col(lv_obj_t* scr, const char* t, int cx, int y) {
 
 // ── Header marks (replace the text header on the AI views) ───────────────────
 static void header_mascot(lv_obj_t* scr) {
-    // splash_mini renders at (px/20)*20, so ask 60 → cell 3 → a real 60px canvas
-    // (48 quantised down to 40 — that was the "puny" bug). The opaque canvas must
-    // clear the SESSION ring; with the rings lowered to ay=48 its nearest arc
-    // pixel is ~(68,76), just below this 60px box at (12,10)→bottom y70.
-    if (splash_mini_init(&s_mascot, scr, "idle look around", 60)) {
-        lv_obj_set_pos(s_mascot.canvas, 12, 10);
+    // splash_mini quantises to (px/20)*20, so the sizes are 60 (cell 3) or 80
+    // (cell 4) — nothing between. Go 80. The canvas is opaque, so its box must
+    // not cross the SESSION ring's outer circle: at (6,6) the box corner (86,86)
+    // sits ~3.5px outside the ring when the ring band is lowered to ay=76.
+    if (splash_mini_init(&s_mascot, scr, "idle look around", 80)) {
+        lv_obj_set_pos(s_mascot.canvas, 6, 6);
         if (s_nbuf < 16) s_bufs[s_nbuf++] = s_mascot.buf;  // free_bufs reclaims it each render
         s_mascot_on = true;  // the pulse timer now animates it
     }
@@ -730,12 +730,12 @@ static void header_grok_logo(lv_obj_t* scr) {
     proto_icon_dsc(&dsc, GROK_LOGO_LOBE_WIDTH, GROK_LOGO_LOBE_HEIGHT, grok_logo_lobe_data);
     lv_obj_t* img = lv_image_create(scr);
     lv_image_set_src(img, &dsc);
-    // The baked asset is 46×44 (puny at 3.7 mm). Upscale ~1.56× (256=100%) to a
-    // ~72 px header mark, scaling from the top-left so set_pos still anchors it.
-    // The Grok ring is centred (left edge x≈125), so a 72 px logo at x24 clears.
+    // The baked asset is 46×44. Upscale 2× (256=100%) to a ~92 px header mark,
+    // scaling from the top-left so set_pos still anchors it. The Grok ring is
+    // centred (left edge x≈125), so a 92 px logo at x20 clears it with room.
     lv_image_set_pivot(img, 0, 0);
-    lv_image_set_scale(img, 400);
-    lv_obj_set_pos(img, 24, 12);
+    lv_image_set_scale(img, 512);
+    lv_obj_set_pos(img, 20, 10);
 }
 
 // A model identity chip: colour square + name, packed tight (its own sub-row).
@@ -843,9 +843,9 @@ static void view_claude(lv_obj_t* scr) {
     const int mw = W - 56;
 
     // ── Dual arcs: SESSION (5h) left, WEEKLY (7d) right ──────────────────────
-    // ay=48 (not 40) drops the ring band just enough for the 60px header mascot
-    // to sit in the top-left corner without the opaque canvas notching the arc.
-    const int AS = 192, ay = 48, gap = 16;
+    // ay=76 drops the ring band so the 80px header mascot in the top-left corner
+    // clears the SESSION ring's outer circle (its opaque canvas can't notch it).
+    const int AS = 192, ay = 76, gap = 16;
     const int pair = AS * 2 + gap;
     const int x0 = (W - pair) / 2;
     const int xL = x0, xR = x0 + AS + gap;
@@ -861,12 +861,13 @@ static void view_claude(lv_obj_t* scr) {
     brow_col(scr, "WEEKLY",  cxR, ay + 72);
     pct_col(scr, (int)(sp + 0.5f), cxL, ay + 104, &font_departure_48);
     pct_col(scr, (int)(wp + 0.5f), cxR, ay + 104, &font_departure_48);
-    // Each ring's reset, directly beneath the ring (it no longer fits inside one
-    // at a readable size — and outside it can be full width).
-    reset_col(scr, hcl() ? s_d.session_reset_mins : 63, cxL, ay + 202);
+    // Each ring's reset tucked into its open bottom (the 6-o'clock gap of the
+    // 270° arc), right under the % — reads as "at the bottom of the ring", and
+    // the clock row is narrower than the arc's two descending ends so it clears.
+    reset_col(scr, hcl() ? s_d.session_reset_mins : 63, cxL, ay + 156);
     reset_col(scr, hcl() ? (s_d.scoped_weekly_valid ? s_d.scoped_weekly_reset_mins
                                                      : s_d.weekly_reset_mins)
-                         : 7000, cxR, ay + 202);
+                         : 7000, cxR, ay + 156);
 
     // ── Model-scoped weekly LIMIT (Weekly-Fable/Opus — cap fullness) ─────────
     // Drawn when a scoped weekly is active (or in placeholder/QA mode). When live
@@ -881,7 +882,7 @@ static void view_claude(lv_obj_t* scr) {
             snprintf(flabel, sizeof flabel, "WEEKLY %s", mup);
         }
         // Label sits on the numeral's baseline (dep_48 line 49 vs styrene_24 25).
-        eyebrow_at(scr, flabel, PC_DIM, &font_styrene_24, mx, 300);
+        eyebrow_at(scr, flabel, PC_DIM, &font_styrene_24, mx, 294);
 
         char num[8];
         snprintf(num, sizeof num, "%d", (int)(fp + 0.5f));
@@ -892,23 +893,23 @@ static void view_claude(lv_obj_t* scr) {
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_set_style_pad_column(row, 5, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_align(row, LV_ALIGN_TOP_RIGHT, -mx, 278);
+        lv_obj_align(row, LV_ALIGN_TOP_RIGHT, -mx, 276);
         // Heavier readout colour when urgent.
         rtext(row, num, fcol, &font_departure_48);
         rtext(row, "%", fcol, &font_styrene_24);
 
-        job_meter(scr, mx, 334, mw, 22, fp / 100.0f, fcol);
+        job_meter(scr, mx, 332, mw, 22, fp / 100.0f, fcol);
     }
 
     // ── Models in use right now (one chip each — supports parallel sessions) ──
-    inuse_chips(scr, 372);
+    inuse_chips(scr, 370);
 
     // ── Today's activity $ (hypothetical at API rates — flat-rate sub) ───────
     {
         char spend[16] = "$4.35";
         if (hcl() && s_d.claude_extras_valid)
             snprintf(spend, sizeof spend, "$%.2f", s_d.claude_today_usd);
-        lv_obj_t* row = crow(scr, 410, 12);
+        lv_obj_t* row = crow(scr, 408, 12);
         rtext(row, spend, PC_TEXT, &font_departure_32);
         lv_obj_t* t = rtext(row, "TODAY", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
@@ -931,11 +932,12 @@ static void view_grok(lv_obj_t* scr) {
     job_arc(scr, ax, ay, AS, gw / 100.0f, band(gw), 20, false);
     brow_col(scr, "WEEKLY", cx, ay + 78);
     pct_col(scr, (int)(gw + 0.5f), cx, ay + 108, &font_departure_72);
-    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 240);
+    // Reset tucked into the ring's open bottom, under the % (matches Claude).
+    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 184);
 
     // IN USE — same size/style as the Claude view.
     {
-        lv_obj_t* row = crow(scr, 322, 14);
+        lv_obj_t* row = crow(scr, 300, 14);
         lv_obj_t* lbl = rtext(row, "IN USE", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(lbl, 3, 0);
         model_chip(row, "GROK 4.5", PC_GROK, 14, &font_styrene_24);
@@ -947,7 +949,7 @@ static void view_grok(lv_obj_t* scr) {
     {
         char spend[16] = "$18.60";
         if (hcl()) snprintf(spend, sizeof spend, "$%.2f", s_d.grok_today_usd);
-        lv_obj_t* row = crow(scr, 358, 12);
+        lv_obj_t* row = crow(scr, 350, 12);
         rtext(row, spend, PC_TEXT, &font_departure_48);
         lv_obj_t* t = rtext(row, "TODAY", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
@@ -955,7 +957,7 @@ static void view_grok(lv_obj_t* scr) {
     float sk[7];
     const float* grok_sk = (hcl() && s_d.grok_series_valid) ? norm7(s_d.grok_week_series, sk)
                                                             : nullptr;
-    job_spark(scr, 32, 418, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
+    job_spark(scr, 32, 412, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
