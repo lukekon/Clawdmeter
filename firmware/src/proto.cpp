@@ -281,23 +281,31 @@ static void pulse_cb(lv_timer_t* /*t*/) {
     if (s_mascot_on) splash_mini_tick_one(&s_mascot);
 }
 
-static void start_motion() {
+// intro=true plays the reveal sweep (view entrance); intro=false paints fully
+// revealed at once (a data refresh must not replay the entrance every ~60s).
+// Either way the pulse timer is (re)armed so the spark/mascot keep animating.
+static void start_motion(bool intro) {
     // Kill prior motion tied to our anim var.
     lv_anim_delete(&s_anim_var, reveal_exec);
     if (s_pulse) { lv_timer_delete(s_pulse); s_pulse = nullptr; }
 
-    s_reveal = 0.0f;
-    s_live   = 1.0f;
-    repaint_all();
+    s_live = 1.0f;
+    if (intro) {
+        s_reveal = 0.0f;
+        repaint_all();
 
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, &s_anim_var);
-    lv_anim_set_values(&a, 0, 1000);
-    lv_anim_set_exec_cb(&a, reveal_exec);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);  // ~easeOutCubic family
-    lv_anim_set_duration(&a, 420);
-    lv_anim_start(&a);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, &s_anim_var);
+        lv_anim_set_values(&a, 0, 1000);
+        lv_anim_set_exec_cb(&a, reveal_exec);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);  // ~easeOutCubic family
+        lv_anim_set_duration(&a, 420);
+        lv_anim_start(&a);
+    } else {
+        s_reveal = 1.0f;
+        repaint_all();
+    }
 
     s_pulse = lv_timer_create(pulse_cb, 80, nullptr);
 }
@@ -912,7 +920,9 @@ static void view_grok(lv_obj_t* scr) {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-void proto_render(lv_obj_t* scr) {
+// Rebuild the current view. intro=true plays the entrance sweep (fresh view);
+// intro=false paints it fully revealed (a silent data refresh).
+static void render_view(lv_obj_t* scr, bool intro) {
     s_scr = scr;
     lv_anim_delete(&s_anim_var, reveal_exec);
     if (s_pulse) { lv_timer_delete(s_pulse); s_pulse = nullptr; }
@@ -932,24 +942,26 @@ void proto_render(lv_obj_t* scr) {
         case PV_GROK:   view_grok(scr);   break;
         default:        view_sys(scr);    break;
     }
-    start_motion();
+    start_motion(intro);
 }
+
+void proto_render(lv_obj_t* scr) { render_view(scr, true); }
 
 void proto_cycle(int dir) {
     if (!s_scr) return;
     s_view = (s_view + dir + PV_COUNT) % PV_COUNT;
-    proto_render(s_scr);
+    render_view(s_scr, true);   // view change → play the entrance
 }
 
 void proto_set_view(int v) {
     if (!s_scr) return;
     s_view = ((v % PV_COUNT) + PV_COUNT) % PV_COUNT;
-    proto_render(s_scr);
+    render_view(s_scr, true);   // explicit view jump → play the entrance
 }
 
 void proto_update(const UsageData* data) {
     if (!data || !data->valid) return;
     s_d = *data;
     s_has = true;
-    if (s_scr) proto_render(s_scr);   // re-render the current view from live data
+    if (s_scr) render_view(s_scr, false);   // silent refresh — no entrance replay
 }
