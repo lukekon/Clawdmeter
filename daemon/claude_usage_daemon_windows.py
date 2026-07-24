@@ -27,6 +27,12 @@ import serial.tools.list_ports
 
 DEVICE_NAME = "Clawdmeter"
 
+# Suppress the console window a child powershell.exe would otherwise flash on
+# screen. The daemon runs windowless (wscript/pythonw), so any console-subsystem
+# child with no explicit flag allocates its OWN window — that was the ~10s
+# PowerShell flash on every vitals refresh. 0 (no-op) off Windows.
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # --- USB-serial transport --------------------------------------------------
 # The device is a USB-powered desk gauge that is physically cabled to this PC at
 # all times (it has no battery — unplugging powers it off). Windows' BLE stack
@@ -504,6 +510,7 @@ def _run_telemetry() -> dict:
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-File", str(TELEMETRY_SCRIPT)],
             capture_output=True, text=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW,   # no flashing console window
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return {}
