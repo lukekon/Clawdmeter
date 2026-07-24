@@ -50,7 +50,6 @@ static const float RAM_PCT = 57.0f;
 // Claude's three independent limits (mirrors claude.ai usage panel).
 static const float CLAUDE_SESSION = 63.0f;  // 5h session
 static const float CLAUDE_WEEKLY  = 63.0f;  // 7d all-models weekly
-static const float CLAUDE_FABLE   = 92.0f;  // separate Weekly Fable cap
 static const float GROK_WEEKLY    = 21.0f;
 
 // Per-core mock (12 threads) — CPU columns heatmap.
@@ -60,7 +59,9 @@ static const float CORES[12] = {
 };
 static const int NCORES = 12;
 
-// 7-day series (normalised 0..1 of daily ceiling).
+// 7-day series (normalised 0..1 of daily ceiling) — spark placeholders for QA
+// without the daemon.
+static const float WEEK_CLAUDE[7] = { 0.42f, 0.61f, 0.35f, 0.88f, 0.55f, 0.70f, 0.73f };
 static const float WEEK_GROK[7]   = { 0.12f, 0.18f, 0.09f, 0.28f, 0.15f, 0.22f, 0.21f };
 
 // ── Live data (Phase B) ──────────────────────────────────────────────────────
@@ -81,8 +82,6 @@ static float ram_pct() { return hram() ? (float)s_d.vitals.ram_pct : RAM_PCT; }
 
 static float cl_session()   { return hcl() ? s_d.session_pct : CLAUDE_SESSION; }
 static float cl_weekly()    { return hcl() ? s_d.weekly_pct  : CLAUDE_WEEKLY; }
-static bool  cl_scoped_ok() { return hcl() && s_d.scoped_weekly_valid; }
-static float cl_scoped()    { return cl_scoped_ok() ? s_d.scoped_weekly_pct : CLAUDE_FABLE; }
 static float grok_pct()     { return hcl() ? s_d.grok_week_pct : GROK_WEEKLY; }
 
 // model display name → its identity hue (one violet family: Opus/Sonnet/Haiku/Fable
@@ -104,12 +103,6 @@ static void fmt_dur(char* b, size_t n, int mins) {
     else                  snprintf(b, n, "%dD", (mins + 720) / 1440);
 }
 
-static void upcpy(char* dst, size_t n, const char* src) {
-    size_t i = 0;
-    for (; src[i] && i + 1 < n; i++) dst[i] = (char)toupper((unsigned char)src[i]);
-    dst[i] = 0;
-}
-
 // Normalise a 7-sample $ series to 0..1 by its max into out[7]; returns out, or
 // nullptr when the series is empty/all-zero (caller uses the placeholder then).
 static const float* norm7(const float* src, float* out) {
@@ -126,13 +119,6 @@ enum {
     AI_GAUGE_AS = 230,
     AI_SPARK_H  = 22,
 };
-
-// Limit-meter fill: coral at rest, warn as the cap approaches (not heat bands).
-static lv_color_t limit_fill(float pct) {
-    if (pct >= 95.0f) return PC_RED;
-    if (pct >= 85.0f) return PC_ORANGE;
-    return PC_CLAUDE;
-}
 
 // ── Load heat band (PitCrew heatSeed — never brand blue) ────────────────────
 // >=0.78 red · >=0.55 orange · >=0.30 yellow · else green
@@ -828,19 +814,15 @@ static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
     lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y);
 }
 
-// CLAUDE — the three independent limits, big enough to read from the desk:
-// heat-tiered Session/Weekly rings + the model-scoped weekly bar, resets under
-// each ring, models-in-use chips, today's activity $.
-//
-// The BY MODEL proportion bar (+legend) and the 7-day spark used to live here
-// too; at legible type sizes there is no room for them, and the limits are what
-// the device exists to show. They are the parts to bring back on a 7th view.
+// CLAUDE — the two all-model limits as heat-tiered rings (Session 5h · Weekly 7d),
+// then the same footer as the Grok view (models-in-use · today's $ · 7-day spark).
+// Intentionally a mirror of view_grok with one extra ring — the model-scoped
+// Weekly-Fable limit was dropped for that symmetry (its data is still in the
+// payload, so it can return as a third ring if wanted).
 static void view_claude(lv_obj_t* scr) {
     chrome(scr, nullptr);
     header_mascot(scr);
     const int W = board_caps().width;
-    const int mx = 28;
-    const int mw = W - 56;
 
     // ── Dual arcs: SESSION (5h) left, WEEKLY (7d) right ──────────────────────
     // ay=76 drops the ring band so the 80px header mascot in the top-left corner
@@ -851,69 +833,36 @@ static void view_claude(lv_obj_t* scr) {
     const int xL = x0, xR = x0 + AS + gap;
     const int cxL = xL + AS / 2, cxR = xR + AS / 2;
 
-    // Rings are heat-tiered by % now (green→yellow→orange→red), not brand coral.
+    // Rings are heat-tiered by % (green→yellow→orange→red), not brand coral.
     const float sp = cl_session(), wp = cl_weekly();
     job_arc(scr, xL, ay, AS, sp / 100.0f, band(sp), 18, false);
     job_arc(scr, xR, ay, AS, wp / 100.0f, band(wp), 18, false);
-    // Stack sits below the ring's midline: the inner chord is widest there, and
-    // "SESSION" at a readable size clips the stroke any higher.
-    brow_col(scr, "SESSION", cxL, ay + 72);
-    brow_col(scr, "WEEKLY",  cxR, ay + 72);
-    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 104, &font_departure_48);
-    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 104, &font_departure_48);
-    // Each ring's reset tucked into its open bottom (the 6-o'clock gap of the
-    // 270° arc), right under the % — reads as "at the bottom of the ring", and
-    // the clock row is narrower than the arc's two descending ends so it clears.
-    reset_col(scr, hcl() ? s_d.session_reset_mins : 63, cxL, ay + 156);
-    reset_col(scr, hcl() ? (s_d.scoped_weekly_valid ? s_d.scoped_weekly_reset_mins
-                                                     : s_d.weekly_reset_mins)
-                         : 7000, cxR, ay + 156);
+    // Inner stack: % on top (centred on the ring), label under it, reset tucked
+    // into the open 6-o'clock gap. The clock row is narrower than the arc's two
+    // descending ends, so it clears them.
+    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 72, &font_departure_48);
+    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 72, &font_departure_48);
+    brow_col(scr, "SESSION", cxL, ay + 126);
+    brow_col(scr, "WEEKLY",  cxR, ay + 126);
+    reset_col(scr, hcl() ? s_d.session_reset_mins : 63,   cxL, ay + 158);
+    reset_col(scr, hcl() ? s_d.weekly_reset_mins  : 7000, cxR, ay + 158);
 
-    // ── Model-scoped weekly LIMIT (Weekly-Fable/Opus — cap fullness) ─────────
-    // Drawn when a scoped weekly is active (or in placeholder/QA mode). When live
-    // data says there is none, the slot is left empty rather than faking a wall.
-    if (!hcl() || s_d.scoped_weekly_valid) {
-        const float fp = cl_scoped();
-        lv_color_t fcol = limit_fill(fp);
-        char flabel[20] = "WEEKLY FABLE";
-        if (hcl() && s_d.scoped_weekly_model[0]) {
-            char mup[14];
-            upcpy(mup, sizeof mup, s_d.scoped_weekly_model);
-            snprintf(flabel, sizeof flabel, "WEEKLY %s", mup);
-        }
-        // Label sits on the numeral's baseline (dep_48 line 49 vs styrene_24 25).
-        eyebrow_at(scr, flabel, PC_DIM, &font_styrene_24, mx, 294);
-
-        char num[8];
-        snprintf(num, sizeof num, "%d", (int)(fp + 0.5f));
-        lv_obj_t* row = lv_obj_create(scr);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(row, 5, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_align(row, LV_ALIGN_TOP_RIGHT, -mx, 276);
-        // Heavier readout colour when urgent.
-        rtext(row, num, fcol, &font_departure_48);
-        rtext(row, "%", fcol, &font_styrene_24);
-
-        job_meter(scr, mx, 332, mw, 22, fp / 100.0f, fcol);
-    }
-
-    // ── Models in use right now (one chip each — supports parallel sessions) ──
-    inuse_chips(scr, 370);
-
-    // ── Today's activity $ (hypothetical at API rates — flat-rate sub) ───────
+    // ── Footer (identical rhythm to view_grok) ───────────────────────────────
+    inuse_chips(scr, 300);
     {
         char spend[16] = "$4.35";
         if (hcl() && s_d.claude_extras_valid)
             snprintf(spend, sizeof spend, "$%.2f", s_d.claude_today_usd);
-        lv_obj_t* row = crow(scr, 408, 12);
-        rtext(row, spend, PC_TEXT, &font_departure_32);
+        lv_obj_t* row = crow(scr, 350, 12);
+        rtext(row, spend, PC_TEXT, &font_departure_48);
         lv_obj_t* t = rtext(row, "TODAY", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
     }
+    float sk[7];
+    const float* claude_sk = (hcl() && s_d.claude_extras_valid) ? norm7(s_d.claude_week, sk)
+                                                                : nullptr;
+    job_spark(scr, 32, 412, W - 64, AI_SPARK_H, claude_sk ? claude_sk : WEEK_CLAUDE,
+              7, lv_color_hex(0x9298a2));  // neutral grey (Luke: no coral on the spark)
 }
 
 // GROK — roomy single weekly radial (deep blue); hypothetical API-rate activity $.
@@ -925,15 +874,13 @@ static void view_grok(lv_obj_t* scr) {
     const int ax = (W - AS) / 2;
     const int cx = ax + AS / 2;
 
-    // Ring heat-tiered by %. Inner stack uses the SAME fonts + spacing rhythm as
-    // the Claude rings (WEEKLY / dep-20 % / small RESETS), centred in the ring.
-    // Grok carries one limit, so its % gets the full hero treatment.
+    // Ring heat-tiered by %. Inner stack mirrors Claude: % on top (hero dep_72,
+    // Grok has just one limit), WEEKLY under it, reset tucked into the open bottom.
     const float gw = grok_pct();
     job_arc(scr, ax, ay, AS, gw / 100.0f, band(gw), 20, false);
-    brow_col(scr, "WEEKLY", cx, ay + 78);
-    pct_col(scr, (int)(gw + 0.5f), cx, ay + 108, &font_departure_72);
-    // Reset tucked into the ring's open bottom, under the % (matches Claude).
-    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 184);
+    pct_col(scr, (int)(gw + 0.5f), cx, ay + 76, &font_departure_72);
+    brow_col(scr, "WEEKLY", cx, ay + 156);
+    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 188);
 
     // IN USE — same size/style as the Claude view.
     {
