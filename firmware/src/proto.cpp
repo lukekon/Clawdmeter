@@ -714,10 +714,12 @@ static void brow_col(lv_obj_t* scr, const char* t, int cx, int y) {
 
 // ── Header marks (replace the text header on the AI views) ───────────────────
 static void header_mascot(lv_obj_t* scr) {
-    // 48 px is the ceiling here: the canvas is opaque, and the 192 px SESSION
-    // ring's top-left arc reaches within ~96 px of (136,136).
-    if (splash_mini_init(&s_mascot, scr, "idle look around", 48)) {
-        lv_obj_set_pos(s_mascot.canvas, 16, 10);
+    // splash_mini renders at (px/20)*20, so ask 60 → cell 3 → a real 60px canvas
+    // (48 quantised down to 40 — that was the "puny" bug). The opaque canvas must
+    // clear the SESSION ring; with the rings lowered to ay=48 its nearest arc
+    // pixel is ~(68,76), just below this 60px box at (12,10)→bottom y70.
+    if (splash_mini_init(&s_mascot, scr, "idle look around", 60)) {
+        lv_obj_set_pos(s_mascot.canvas, 12, 10);
         if (s_nbuf < 16) s_bufs[s_nbuf++] = s_mascot.buf;  // free_bufs reclaims it each render
         s_mascot_on = true;  // the pulse timer now animates it
     }
@@ -728,7 +730,12 @@ static void header_grok_logo(lv_obj_t* scr) {
     proto_icon_dsc(&dsc, GROK_LOGO_LOBE_WIDTH, GROK_LOGO_LOBE_HEIGHT, grok_logo_lobe_data);
     lv_obj_t* img = lv_image_create(scr);
     lv_image_set_src(img, &dsc);
-    lv_obj_set_pos(img, 24, 14);
+    // The baked asset is 46×44 (puny at 3.7 mm). Upscale ~1.56× (256=100%) to a
+    // ~72 px header mark, scaling from the top-left so set_pos still anchors it.
+    // The Grok ring is centred (left edge x≈125), so a 72 px logo at x24 clears.
+    lv_image_set_pivot(img, 0, 0);
+    lv_image_set_scale(img, 400);
+    lv_obj_set_pos(img, 24, 12);
 }
 
 // A model identity chip: colour square + name, packed tight (its own sub-row).
@@ -769,18 +776,56 @@ static void inuse_chips(lv_obj_t* scr, int y) {
     }
 }
 
-// "RESETS <dur>" centred under a ring column.
+// Rasterise a small clock face (ring + two hands) into an RGB565 canvas buffer.
+// Replaces the word "RESETS" so the countdown value can be bigger. Drawn rather
+// than a font glyph — no bundled font carries a clock, and this stays crisp at
+// any size. Background is true black (invisible over the AMOLED-black screen).
+static inline void px565(uint16_t* b, int D, int x, int y, uint16_t c) {
+    if (x >= 0 && x < D && y >= 0 && y < D) b[y * D + x] = c;
+}
+static void draw_clock(uint16_t* b, int D, lv_color_t col) {
+    const uint16_t c = lv_color_to_u16(col);
+    for (int i = 0; i < D * D; i++) b[i] = 0x0000;
+    const float cx = (D - 1) / 2.0f, cy = (D - 1) / 2.0f;
+    const float r = D / 2.0f - 1.5f;
+    // 2px-thick rim.
+    for (float t = 0; t < 6.2832f; t += 0.03f) {
+        float ct = cosf(t), st = sinf(t);
+        px565(b, D, (int)lroundf(cx + r * ct),        (int)lroundf(cy + r * st),        c);
+        px565(b, D, (int)lroundf(cx + (r - 1) * ct),  (int)lroundf(cy + (r - 1) * st),  c);
+    }
+    // Hands: minute → 12 o'clock (up), hour → 4 o'clock (down-right). 2px each.
+    for (float s = 0; s <= 1.0f; s += 0.03f) {
+        int mx = (int)lroundf(cx), my = (int)lroundf(cy - s * r * 0.78f);
+        px565(b, D, mx, my, c); px565(b, D, mx + 1, my, c);
+        int hx = (int)lroundf(cx + s * r * 0.50f * 0.87f);
+        int hy = (int)lroundf(cy + s * r * 0.50f * 0.50f);
+        px565(b, D, hx, hy, c); px565(b, D, hx, hy + 1, c);
+    }
+}
+
+// A clock icon + the countdown value, centred under a ring column. The clock
+// stands in for the old "RESETS" word, buying room for a larger numeral.
 static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
-    char d[8], b[16];
+    char d[8];
     fmt_dur(d, sizeof d, mins);
-    snprintf(b, sizeof b, "RESETS %s", d);
-    lv_obj_t* l = lv_label_create(scr);
-    lv_label_set_text(l, b);
-    lv_obj_set_style_text_font(l, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(l, PC_DIM, 0);
-    lv_obj_set_style_text_letter_space(l, 2, 0);
-    lv_obj_update_layout(l);
-    lv_obj_set_pos(l, cx - lv_obj_get_width(l) / 2, y);
+    lv_obj_t* row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    const int D = 28;
+    uint16_t* b = mkbuf(D, D);
+    if (b) {
+        draw_clock(b, D, PC_DIM);
+        lv_obj_t* cv = lv_canvas_create(row);
+        lv_canvas_set_buffer(cv, b, D, D, LV_COLOR_FORMAT_RGB565);
+    }
+    rtext(row, d, PC_DIM, &font_departure_32);
+    lv_obj_update_layout(row);
+    lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y);
 }
 
 // CLAUDE — the three independent limits, big enough to read from the desk:
@@ -798,7 +843,9 @@ static void view_claude(lv_obj_t* scr) {
     const int mw = W - 56;
 
     // ── Dual arcs: SESSION (5h) left, WEEKLY (7d) right ──────────────────────
-    const int AS = 192, ay = 40, gap = 16;
+    // ay=48 (not 40) drops the ring band just enough for the 60px header mascot
+    // to sit in the top-left corner without the opaque canvas notching the arc.
+    const int AS = 192, ay = 48, gap = 16;
     const int pair = AS * 2 + gap;
     const int x0 = (W - pair) / 2;
     const int xL = x0, xR = x0 + AS + gap;
