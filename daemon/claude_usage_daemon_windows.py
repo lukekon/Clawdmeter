@@ -312,8 +312,14 @@ KIMI_USAGE_URL = os.environ.get(
 # to the prompt), so each is billed at its own rate with no subtraction.
 KIMI_RATES = (3.0, 15.0, 0.30, 3.0)
 KIMI_RECOMPUTE_S = 300
+# Reset times are stored as ABSOLUTE epochs (not pre-computed minutes): the token
+# is short-lived (15-min TTL, refreshed only while the Kimi extension runs), so
+# between live reads we recompute minutes-until fresh on every poll from the epoch.
+# Storing minutes would freeze the countdown at its last-read value while the real
+# (wall-clock) reset marched past.
 _kimi_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "daily": [0.0] * 7, "model": "",
-               "s_pct": 0, "s_reset": -1, "w_pct": 0, "w_reset": -1, "lim_valid": False}
+               "s_pct": 0, "s_reset_epoch": None, "w_pct": 0, "w_reset_epoch": None,
+               "lim_valid": False}
 
 
 def _kimi_label(model: str) -> str:
@@ -457,9 +463,9 @@ async def _read_kimi_limits() -> dict | None:
     s_detail = (session or {}).get("detail") or {}
     return {
         "s_pct": _pct_of(s_detail),
-        "s_reset": _mins_until(_iso_to_epoch(s_detail.get("resetTime"))),
+        "s_reset_epoch": _iso_to_epoch(s_detail.get("resetTime")),
         "w_pct": _pct_of(weekly),
-        "w_reset": _mins_until(_iso_to_epoch(weekly.get("resetTime"))),
+        "w_reset_epoch": _iso_to_epoch(weekly.get("resetTime")),
     }
 
 
@@ -490,9 +496,9 @@ async def fetch_kimi_usage() -> dict:
             "km": round(c["week"]),
             "kmd": round(c["today"]),
             "kms": c["s_pct"],
-            "kmsr": c["s_reset"],
+            "kmsr": _mins_until(c["s_reset_epoch"]),  # recomputed live from the epoch
             "kmw": c["w_pct"],
-            "kmwr": c["w_reset"],
+            "kmwr": _mins_until(c["w_reset_epoch"]),
             "kml": 1 if c["lim_valid"] else 0,
             "kmx": {"wk": [round(x, 4) for x in c["daily"]]},
             "kmm": c["model"],
