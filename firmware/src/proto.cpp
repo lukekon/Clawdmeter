@@ -4,6 +4,7 @@
 #include "data.h"
 #include "splash.h"
 #include "logo_grok_lobe.h"
+#include "logo_kimi.h"
 #include "hal/board_caps.h"
 #include <esp_heap_caps.h>
 #include <cstdio>
@@ -35,7 +36,7 @@ LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
 
 // ── Views ───────────────────────────────────────────────────────────────────
-enum { PV_SYS = 0, PV_CPU, PV_GPU, PV_RAM, PV_CLAUDE, PV_GROK, PV_COUNT };
+enum { PV_SYS = 0, PV_CPU, PV_GPU, PV_RAM, PV_CLAUDE, PV_KIMI, PV_GROK, PV_COUNT };
 static int       s_view = PV_SYS;
 static lv_obj_t* s_scr  = nullptr;
 
@@ -51,6 +52,9 @@ static const float RAM_PCT = 57.0f;
 static const float CLAUDE_SESSION = 63.0f;  // 5h session
 static const float CLAUDE_WEEKLY  = 63.0f;  // 7d all-models weekly
 static const float GROK_WEEKLY    = 21.0f;
+// Kimi's two limits mirror Claude's (5h session + 7d weekly), from Moonshot's usage API.
+static const float KIMI_SESSION   = 61.0f;  // 5h window
+static const float KIMI_WEEKLY    = 12.0f;  // 7d window
 
 // Per-core mock (12 threads) — CPU columns heatmap.
 static const float CORES[12] = {
@@ -83,6 +87,9 @@ static float ram_pct() { return hram() ? (float)s_d.vitals.ram_pct : RAM_PCT; }
 static float cl_session()   { return hcl() ? s_d.session_pct : CLAUDE_SESSION; }
 static float cl_weekly()    { return hcl() ? s_d.weekly_pct  : CLAUDE_WEEKLY; }
 static float grok_pct()     { return hcl() ? s_d.grok_week_pct : GROK_WEEKLY; }
+static bool  hki()          { return s_has && s_d.valid && s_d.kimi_valid; }
+static float ki_session()   { return hki() ? s_d.kimi_session_pct : KIMI_SESSION; }
+static float ki_weekly()    { return hki() ? s_d.kimi_weekly_pct  : KIMI_WEEKLY; }
 
 // model display name → its identity hue (one violet family: Opus/Sonnet/Haiku/Fable
 // spaced across the spectrum · Grok red); default to the Claude coral.
@@ -734,6 +741,20 @@ static void header_grok_logo(lv_obj_t* scr) {
     lv_obj_set_pos(img, 20, 10);
 }
 
+static void header_kimi_logo(lv_obj_t* scr) {
+    static lv_image_dsc_t dsc;
+    proto_icon_dsc(&dsc, KIMI_LOGO_WIDTH, KIMI_LOGO_HEIGHT, kimi_logo_data);
+    lv_obj_t* img = lv_image_create(scr);
+    lv_image_set_src(img, &dsc);
+    // Baked 46×46. Kimi's view is dual-ring like Claude, whose left ring sits at
+    // x40 — so the mark keeps the mascot's cleared footprint: ~80 px at (6,6) has
+    // its transparent margins overlap the ring while the white "K" glyph stays
+    // clear (the opaque mascot clears the same ring band at ay=76).
+    lv_image_set_pivot(img, 0, 0);
+    lv_image_set_scale(img, 445);   // 46 → ~80 px
+    lv_obj_set_pos(img, 6, 6);
+}
+
 // A model identity chip: colour square + name, packed tight (its own sub-row).
 static lv_obj_t* model_chip(lv_obj_t* parent, const char* name, lv_color_t col,
                             int sq, const lv_font_t* font) {
@@ -876,6 +897,58 @@ static void view_claude(lv_obj_t* scr) {
               7, lv_color_hex(0x9298a2));  // neutral grey (Luke: no coral on the spark)
 }
 
+// KIMI — Moonshot's two real limits as heat-tiered rings (Session 5h · Weekly 7d),
+// read from /coding/v1/usages. Same rhythm as the Claude view (dual arcs + footer),
+// with the Kimi mark and a Kimi-blue spark. The $ figures are activity at API rates
+// (flat-rate membership ⇒ real bill ~$0), see [[ai-subscriptions]].
+static void view_kimi(lv_obj_t* scr) {
+    chrome(scr, nullptr);
+    header_kimi_logo(scr);
+    const int W = board_caps().width;
+
+    // Identical ring geometry to view_claude (ay=76 keeps the 80px corner mark off
+    // the SESSION ring's outer circle). SESSION (5h) left, WEEKLY (7d) right.
+    const int AS = 192, ay = 76, gap = 16;
+    const int pair = AS * 2 + gap;
+    const int x0 = (W - pair) / 2;
+    const int xL = x0, xR = x0 + AS + gap;
+    const int cxL = xL + AS / 2, cxR = xR + AS / 2;
+
+    const float sp = ki_session(), wp = ki_weekly();
+    job_arc(scr, xL, ay, AS, sp / 100.0f, band(sp), 18, false);
+    job_arc(scr, xR, ay, AS, wp / 100.0f, band(wp), 18, false);
+    pct_col(scr, (int)(sp + 0.5f), cxL, ay + 58, &font_departure_48);
+    pct_col(scr, (int)(wp + 0.5f), cxR, ay + 58, &font_departure_48);
+    brow_col(scr, "SESSION", cxL, ay + 110);
+    brow_col(scr, "WEEKLY",  cxR, ay + 110);
+    reset_col(scr, hki() ? s_d.kimi_session_reset_mins : 240,  cxL, ay + 140);
+    reset_col(scr, hki() ? s_d.kimi_weekly_reset_mins  : 9878, cxR, ay + 140);
+
+    // ── Footer (same rhythm as Claude/Grok) ──────────────────────────────────
+    {
+        lv_obj_t* row = crow(scr, 300, 14);
+        lv_obj_t* lbl = rtext(row, "IN USE", PC_DIM, &font_styrene_24);
+        lv_obj_set_style_text_letter_space(lbl, 3, 0);
+        const char* m = (hki() && s_d.kimi_model[0]) ? s_d.kimi_model : "K3";
+        if (hki() && !s_d.kimi_model[0])
+            rtext(row, "\xE2\x80\x94", PC_GREY, &font_styrene_28);  // idle
+        else
+            model_chip(row, m, PC_KIMI, 14, &font_styrene_24);
+    }
+    {
+        char spend[16] = "$6.80";
+        if (hki()) snprintf(spend, sizeof spend, "$%.2f", s_d.kimi_today_usd);
+        lv_obj_t* row = crow(scr, 350, 12);
+        rtext(row, spend, PC_TEXT, &font_departure_48);
+        lv_obj_t* t = rtext(row, "TODAY", PC_DIM, &font_styrene_24);
+        lv_obj_set_style_text_letter_space(t, 3, 0);
+    }
+    float sk[7];
+    const float* kimi_sk = (hki() && s_d.kimi_series_valid) ? norm7(s_d.kimi_week_series, sk)
+                                                            : nullptr;
+    job_spark(scr, 32, 412, W - 64, AI_SPARK_H, kimi_sk ? kimi_sk : WEEK_GROK, 7, PC_KIMI);
+}
+
 // GROK — roomy single weekly radial (deep blue); hypothetical API-rate activity $.
 static void view_grok(lv_obj_t* scr) {
     chrome(scr, nullptr);
@@ -939,6 +1012,7 @@ static void render_view(lv_obj_t* scr, bool intro) {
         case PV_GPU:    view_gpu(scr);    break;
         case PV_RAM:    view_ram(scr);    break;
         case PV_CLAUDE: view_claude(scr); break;
+        case PV_KIMI:   view_kimi(scr);   break;
         case PV_GROK:   view_grok(scr);   break;
         default:        view_sys(scr);    break;
     }

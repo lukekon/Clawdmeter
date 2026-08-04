@@ -42,6 +42,7 @@
 // Provider + model identity (AI views only)
 #define PC_CLAUDE   lv_color_hex(0xd97757)   // Anthropic coral — all Claude gauges
 #define PC_GROK     lv_color_hex(0x2b4fe0)   // deep royal blue — all Grok gauges
+#define PC_KIMI     lv_color_hex(0x1783ff)   // Moonshot Kimi blue — Kimi mark/spark
 // Model chips/segments — one violet family (near Fable), spaced enough to read
 // apart. Rings no longer use these (they're heat-tiered); these are model identity.
 #define PC_OPUS     lv_color_hex(0x8b5cf6)   // vivid violet (flagship)

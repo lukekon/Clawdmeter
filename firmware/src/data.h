@@ -59,6 +59,21 @@ struct UsageData {
     int grok_today_reset_mins; // minutes until local midnight ("today" resets there)
     bool grok_series_valid;      // "gx" present → 7-day Grok $ series available
     float grok_week_series[7];   // 7-day daily $ activity (index 6 = today)
+    // Kimi (Moonshot) activity + real limits from the daemon. The 5h/7d limit %
+    // come from Moonshot's /coding/v1/usages endpoint (mirrors claude.ai's dual
+    // window); the $ figures are estimated at API rates — a gauge, not a bill
+    // (Kimi Code membership is flat-rate). Absent → the device hides the Kimi view.
+    bool kimi_valid;             // "km" field present → the device can show a Kimi view
+    float kimi_session_pct;      // 5-hour window utilisation % (0-100)
+    int kimi_session_reset_mins; // minutes until the 5h window resets (-1 = unknown)
+    float kimi_weekly_pct;       // 7-day window utilisation % (0-100)
+    int kimi_weekly_reset_mins;  // minutes until the 7d window resets (-1 = unknown)
+    bool kimi_limits_valid;      // "kml"=1 → the 5h/7d % above are live (token was fresh)
+    float kimi_week_usd;         // Kimi Code spend this week, $ at API rates
+    float kimi_today_usd;        // ...today
+    bool kimi_series_valid;      // "kmx" present → 7-day Kimi $ series available
+    float kimi_week_series[7];   // 7-day daily $ activity (index 6 = today)
+    char kimi_model[16];         // model in use now (e.g. "K3"); "" = idle
     // Claude's model-scoped weekly limit (the "Weekly Fable"/"Weekly Opus" wall) —
     // NOT in the Messages-API headers; read from /api/oauth/usage. Absent → hide it.
     bool scoped_weekly_valid;

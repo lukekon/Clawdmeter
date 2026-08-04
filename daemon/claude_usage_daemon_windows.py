@@ -282,6 +282,215 @@ async def fetch_grok_usage() -> dict:
         return {}
 
 
+# --- Kimi (Moonshot) activity + real 5h/7d limits ---------------------------
+# Two planes, like Grok: $ activity is computed HERE from the local Kimi Code
+# wire logs (no network), while the 5h/7d limit % come from Moonshot's own usage
+# endpoint (the numbers the kimi.com "My Quota" panel shows). The endpoint is the
+# one the Kimi Code extension itself calls; the OAuth token lives in the CLI's
+# credential file, kept fresh by the extension while it runs. When the token is
+# stale (extension closed a while), the limits hold their last-good reading and
+# only the $ activity keeps updating — the view never shows an invented number.
+KIMI_HOME = Path(os.environ.get("KIMI_CODE_HOME", Path.home() / ".kimi-code"))
+KIMI_SESSIONS = KIMI_HOME / "sessions"
+KIMI_CRED = KIMI_HOME / "credentials" / "kimi-code.json"
+KIMI_USAGE_URL = os.environ.get(
+    "KIMI_CODE_BASE_URL", "https://api.kimi.com/coding/v1").rstrip("/") + "/usages"
+# $ per 1M tokens (input, output, cacheRead, cacheCreation). Moonshot k-series;
+# keep in sync with PitCrew's lib/usage-rates.ts. UNLIKE Grok, the four token
+# buckets in usage.record are DISJOINT (inputOther + cacheRead + cacheCreation sum
+# to the prompt), so each is billed at its own rate with no subtraction.
+KIMI_RATES = (3.0, 15.0, 0.30, 3.0)
+KIMI_RECOMPUTE_S = 300
+_kimi_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "daily": [0.0] * 7, "model": "",
+               "s_pct": 0, "s_reset": -1, "w_pct": 0, "w_reset": -1, "lim_valid": False}
+
+
+def _kimi_label(model: str) -> str:
+    """'kimi-code/k3' → 'K3'. Compact chip label; generic so a new k-model needs
+    no code change (the trailing context suffix like '-256k' is dropped)."""
+    seg = (model or "").split("/")[-1]
+    m = re.match(r"k(\d+)", seg)
+    if m:
+        return "K" + m.group(1)
+    if "highspeed" in seg:
+        return "K2.7 HS"
+    if "coding" in seg:
+        return "K2.7"
+    return seg.upper()[:10] if seg else ""
+
+
+def _recompute_kimi() -> tuple[float, float, list, str]:
+    """Scan the local Kimi Code wire logs for this week's / today's $ activity and
+    the model in use now. One wire.jsonl per agent under sessions/<wd>/<sid>/
+    agents/<agent>/; only `usage.record` with usageScope=='turn' carries per-call
+    tokens (mirrors PitCrew's ingestKimiSessions). Files older than the week are
+    skipped whole. Returns (week$, today$, daily[7], in_use_label)."""
+    now = time.time()
+    week_cut = now - 7 * 86400
+    lt = time.localtime(now)
+    today_cut = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    week = today = 0.0
+    daily = [0.0] * 7  # index 6 = today
+    ci, co, cr, cc = KIMI_RATES
+    last_ts, last_model = 0.0, ""
+
+    try:
+        wires = list(KIMI_SESSIONS.glob("*/*/agents/*/wire.jsonl"))
+    except OSError:
+        wires = []
+    for f in wires:
+        try:
+            if f.stat().st_mtime < week_cut:
+                continue
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"usage.record"' not in line:  # cheap prefilter
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "usage.record" or rec.get("usageScope") != "turn":
+                        continue
+                    u = rec.get("usage") or {}
+                    ts_ms = rec.get("time")
+                    if not ts_ms:
+                        continue
+                    ts = ts_ms / 1000.0
+                    cost = (
+                        (u.get("inputOther") or 0) * ci
+                        + (u.get("output") or 0) * co
+                        + (u.get("inputCacheRead") or 0) * cr
+                        + (u.get("inputCacheCreation") or 0) * cc
+                    ) / 1_000_000.0
+                    if ts > last_ts:
+                        last_ts, last_model = ts, rec.get("model") or ""
+                    if cost <= 0:
+                        continue
+                    if ts >= week_cut:
+                        week += cost
+                    if ts >= today_cut:
+                        today += cost
+                    idx = 6 + int((ts - today_cut) // 86400)
+                    if 0 <= idx < 7:
+                        daily[idx] += cost
+        except OSError:
+            continue
+
+    # "In use now" = the model of the most recent record, but only if it's recent
+    # (a parallel session running now), else idle — same spirit as the Claude chip.
+    model = _kimi_label(last_model) if (now - last_ts) <= 900 else ""
+    return week, today, daily, model
+
+
+def _window_minutes(w: dict) -> float:
+    """A limit window's duration in minutes (proto-style timeUnit enum)."""
+    d = w.get("duration") or 0
+    unit = w.get("timeUnit") or ""
+    if "HOUR" in unit:
+        return d * 60
+    if "DAY" in unit:
+        return d * 1440
+    if "SECOND" in unit:
+        return d / 60.0
+    return d  # TIME_UNIT_MINUTE (or unspecified)
+
+
+def _pct_of(detail: dict) -> int:
+    """used/limit → 0-100 int, clamped; 0 when limit is missing/zero."""
+    try:
+        limit = float(detail.get("limit") or 0)
+        used = float(detail.get("used") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if limit <= 0:
+        return 0
+    return max(0, min(100, int(round(used / limit * 100))))
+
+
+async def _read_kimi_limits() -> dict | None:
+    """Moonshot's real 5h + 7d Kimi Code limits from GET /coding/v1/usages, or None
+    on any failure (missing/expired token, network, unexpected shape). Response:
+    top-level `usage` = the 7-day window; `limits[]` carries the shorter windows
+    (the 300-minute = 5-hour one is the session). Numbers arrive as decimal strings."""
+    try:
+        cred = json.loads(KIMI_CRED.read_text(encoding="utf-8"))
+        token = cred.get("access_token")
+        if not token:
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as http:
+            resp = await http.get(KIMI_USAGE_URL,
+                                  headers={"Authorization": f"Bearer {token}",
+                                           "Accept": "application/json"})
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        log(f"Kimi limit read failed: {e}")
+        return None
+    except Exception as e:  # a usage-endpoint hiccup must never touch the Claude path
+        log(f"Kimi limit read error: {e}")
+        return None
+    weekly = data.get("usage") or {}
+    limits = data.get("limits") or []
+    # Session = the shortest-window limit (the 5-hour / 300-min one).
+    session = None
+    for l in limits:
+        if _window_minutes(l.get("window") or {}) <= 0:
+            continue
+        if session is None or _window_minutes(l["window"]) < _window_minutes(session["window"]):
+            session = l
+    s_detail = (session or {}).get("detail") or {}
+    return {
+        "s_pct": _pct_of(s_detail),
+        "s_reset": _mins_until(_iso_to_epoch(s_detail.get("resetTime"))),
+        "w_pct": _pct_of(weekly),
+        "w_reset": _mins_until(_iso_to_epoch(weekly.get("resetTime"))),
+    }
+
+
+async def fetch_kimi_usage() -> dict:
+    """Kimi fields for the payload, cached for KIMI_RECOMPUTE_S:
+      km/kmd     = week/today $ activity (API rates — a gauge, not a bill)
+      kms/kmsr   = 5-hour window % + reset (mins)
+      kmw/kmwr   = 7-day window % + reset (mins)
+      kml        = 1 when the % above are live (token was fresh this poll), else 0
+      kmx        = 7-day $ activity series for the sparkline (index 6 = today)
+      kmm        = model in use now (e.g. "K3"), "" when idle
+    Returns {} (device hides the Kimi view) only when there is no signal at all."""
+    try:
+        now = time.time()
+        if now - _kimi_cache["ts"] >= KIMI_RECOMPUTE_S:
+            week, today, daily, model = _recompute_kimi()
+            _kimi_cache.update(ts=now, week=week, today=today, daily=daily, model=model)
+            lim = await _read_kimi_limits()
+            if lim:
+                _kimi_cache.update(lim_valid=True, **lim)  # refresh last-good
+            else:
+                _kimi_cache["lim_valid"] = False           # keep last-good %/reset
+        c = _kimi_cache
+        if (c["week"] == 0 and c["today"] == 0
+                and not c["s_pct"] and not c["w_pct"] and not c["lim_valid"]):
+            return {}   # Kimi not in use and no limit ever read → no view
+        return {
+            "km": round(c["week"]),
+            "kmd": round(c["today"]),
+            "kms": c["s_pct"],
+            "kmsr": c["s_reset"],
+            "kmw": c["w_pct"],
+            "kmwr": c["w_reset"],
+            "kml": 1 if c["lim_valid"] else 0,
+            "kmx": {"wk": [round(x, 4) for x in c["daily"]]},
+            "kmm": c["model"],
+        }
+    except Exception as e:
+        log(f"Kimi usage compute failed: {e}")
+        return {}
+
+
 # --- Claude model-scoped weekly limit (Weekly-Fable / Weekly-Opus) ----------
 # The Messages-API rate-limit headers expose ONLY the all-models 5h + 7d limits.
 # The separate heavy-model weekly cap (the "Weekly Fable" 92% wall Luke sees on
@@ -766,6 +975,7 @@ async def poll_api(token: str) -> dict | None:
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     payload.update(await fetch_grok_usage())  # adds "g"/"gd" iff PitCrew is up
+    payload.update(await fetch_kimi_usage())  # adds "km"* iff Kimi has any signal
     return payload
 
 

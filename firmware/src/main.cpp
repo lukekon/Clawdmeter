@@ -134,6 +134,21 @@ static bool parse_json(const char* json, UsageData* out) {
     out->grok_series_valid = !doc["gx"].isNull();
     for (int i = 0; i < 7; i++) out->grok_week_series[i] = doc["gx"]["wk"][i] | 0.0f;
 
+    // Kimi (Moonshot) — absent → no Kimi view. "km"=week $ gates the view; the
+    // 5h/7d % ("kms"/"kmw") come from Moonshot's /usages endpoint and are only
+    // trustworthy when "kml"=1 (the OAuth token was fresh when the daemon polled).
+    out->kimi_valid = !doc["km"].isNull();
+    out->kimi_week_usd = doc["km"] | 0.0f;
+    out->kimi_today_usd = doc["kmd"] | 0.0f;
+    out->kimi_session_pct = doc["kms"] | 0.0f;
+    out->kimi_session_reset_mins = doc["kmsr"] | -1;
+    out->kimi_weekly_pct = doc["kmw"] | 0.0f;
+    out->kimi_weekly_reset_mins = doc["kmwr"] | -1;
+    out->kimi_limits_valid = (doc["kml"] | 0) != 0;
+    out->kimi_series_valid = !doc["kmx"].isNull();
+    for (int i = 0; i < 7; i++) out->kimi_week_series[i] = doc["kmx"]["wk"][i] | 0.0f;
+    strlcpy(out->kimi_model, doc["kmm"] | "", sizeof(out->kimi_model));
+
     // Claude model-scoped weekly limit (Weekly-Fable/Opus) — absent → device hides it.
     out->scoped_weekly_valid = !doc["kw"].isNull();
     out->scoped_weekly_pct = doc["kw"] | 0.0f;
@@ -321,6 +336,10 @@ static void check_serial_cmd() {
 #endif
 #ifdef PITCREW_PROTO
             else if (strncmp(cmd_buf, "pview ", 6) == 0) proto_set_view(atoi(cmd_buf + 6));
+            // Relative view cycle — lets a host-side input (e.g. mouse side buttons)
+            // flip views over serial exactly like the device's physical side buttons.
+            else if (strcmp(cmd_buf, "pnext") == 0) proto_cycle(1);
+            else if (strcmp(cmd_buf, "pprev") == 0) proto_cycle(-1);
 #endif
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
@@ -398,6 +417,11 @@ void setup() {
         f.grok_week_pct  = 1;  f.grok_week_reset_mins  = 8449;
         f.grok_today_pct = 1;  f.grok_today_reset_mins = 182;
         f.grok_week_usd = 89;  f.grok_today_usd = 0;
+        f.kimi_valid = true;   f.kimi_limits_valid = true;
+        f.kimi_session_pct = 61; f.kimi_session_reset_mins = 240;
+        f.kimi_weekly_pct  = 12; f.kimi_weekly_reset_mins  = 9878;
+        f.kimi_week_usd = 34;  f.kimi_today_usd = 6.8f;
+        strlcpy(f.kimi_model, "K3", sizeof(f.kimi_model));
         f.ok = true; f.valid = true;
         // Seed the session sparkline with a fake wobbly climb so QA screenshots
         // show a trend line, not a single point.
