@@ -317,9 +317,60 @@ KIMI_RECOMPUTE_S = 300
 # between live reads we recompute minutes-until fresh on every poll from the epoch.
 # Storing minutes would freeze the countdown at its last-read value while the real
 # (wall-clock) reset marched past.
+#
+# We CAN'T refresh the token ourselves (that's an auth-flow guardrail), so when the
+# extension is closed the /usages read 401s. To keep the Kimi view useful anyway we
+# (1) persist the last-good limits to a sidecar so they survive daemon restarts, and
+# (2) PROJECT them forward: the countdown ticks off the stored epoch, and once a
+# window's reset epoch passes we know it rolled over — usage is back to ~0 (you're
+# idle if the extension's closed) — so we zero the % and advance to the next
+# boundary. A later live read corrects everything.
 _kimi_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "daily": [0.0] * 7, "model": "",
-               "s_pct": 0, "s_reset_epoch": None, "w_pct": 0, "w_reset_epoch": None,
+               "s_pct": 0, "s_reset_epoch": None, "s_window_min": 300,
+               "w_pct": 0, "w_reset_epoch": None, "w_window_min": 10080,
                "lim_valid": False}
+_KIMI_SIDECAR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+                 / "Clawdmeter" / "kimi_limits.json")
+_KIMI_SIDECAR_KEYS = ("s_pct", "s_reset_epoch", "s_window_min",
+                      "w_pct", "w_reset_epoch", "w_window_min")
+
+
+def _save_kimi_sidecar() -> None:
+    """Persist last-good limits so a daemon restart doesn't blank the Kimi view."""
+    try:
+        _KIMI_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        _KIMI_SIDECAR.write_text(
+            json.dumps({k: _kimi_cache[k] for k in _KIMI_SIDECAR_KEYS}), encoding="utf-8")
+    except OSError:
+        pass  # best-effort — persistence must never disturb the poll loop
+
+
+def _load_kimi_sidecar() -> None:
+    """Seed the cache from the sidecar on startup (best-effort)."""
+    try:
+        saved = json.loads(_KIMI_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for k in _KIMI_SIDECAR_KEYS:
+        if k in saved and saved[k] is not None:
+            _kimi_cache[k] = saved[k]
+
+
+def _project_window(pct: int, epoch, window_min, now: float) -> tuple[int, int]:
+    """Last-good (pct, reset_epoch) → (pct_now, reset_mins_now), aged off wall-clock.
+    Before the reset: the stored % still holds, countdown ticks down. After it: the
+    window rolled, so % is 0 and we advance the epoch by whole windows to the next
+    future boundary (handles several missed windows if the daemon was off a while)."""
+    if not epoch:
+        return pct, -1
+    if now < epoch:
+        return pct, max(0, int((epoch - now) // 60))
+    if window_min and window_min > 0:
+        span = window_min * 60.0
+        k = int((now - epoch) // span) + 1
+        epoch = epoch + k * span
+        return 0, max(0, int((epoch - now) // 60))
+    return 0, -1
 
 
 def _kimi_label(model: str) -> str:
@@ -464,8 +515,10 @@ async def _read_kimi_limits() -> dict | None:
     return {
         "s_pct": _pct_of(s_detail),
         "s_reset_epoch": _iso_to_epoch(s_detail.get("resetTime")),
+        "s_window_min": _window_minutes((session or {}).get("window") or {}) or 300,
         "w_pct": _pct_of(weekly),
         "w_reset_epoch": _iso_to_epoch(weekly.get("resetTime")),
+        "w_window_min": _window_minutes(weekly.get("window") or {}) or 10080,
     }
 
 
@@ -480,25 +533,33 @@ async def fetch_kimi_usage() -> dict:
     Returns {} (device hides the Kimi view) only when there is no signal at all."""
     try:
         now = time.time()
+        if _kimi_cache["ts"] == 0.0:
+            _load_kimi_sidecar()   # first call — restore last-good across restarts
         if now - _kimi_cache["ts"] >= KIMI_RECOMPUTE_S:
             week, today, daily, model = _recompute_kimi()
             _kimi_cache.update(ts=now, week=week, today=today, daily=daily, model=model)
             lim = await _read_kimi_limits()
             if lim:
                 _kimi_cache.update(lim_valid=True, **lim)  # refresh last-good
+                _save_kimi_sidecar()                       # persist for next restart
             else:
-                _kimi_cache["lim_valid"] = False           # keep last-good %/reset
+                _kimi_cache["lim_valid"] = False           # keep/project last-good
         c = _kimi_cache
+        # Age the last-good limits off wall-clock: countdown ticks down, and a rolled
+        # window (reset epoch passed while idle) zeroes its % and rolls to the next.
+        s_pct, s_reset = _project_window(c["s_pct"], c["s_reset_epoch"], c["s_window_min"], now)
+        w_pct, w_reset = _project_window(c["w_pct"], c["w_reset_epoch"], c["w_window_min"], now)
         if (c["week"] == 0 and c["today"] == 0
-                and not c["s_pct"] and not c["w_pct"] and not c["lim_valid"]):
-            return {}   # Kimi not in use and no limit ever read → no view
+                and not s_pct and not w_pct and not c["lim_valid"]
+                and c["s_reset_epoch"] is None and c["w_reset_epoch"] is None):
+            return {}   # Kimi never used and no limit ever read → no view
         return {
             "km": round(c["week"]),
             "kmd": round(c["today"]),
-            "kms": c["s_pct"],
-            "kmsr": _mins_until(c["s_reset_epoch"]),  # recomputed live from the epoch
-            "kmw": c["w_pct"],
-            "kmwr": _mins_until(c["w_reset_epoch"]),
+            "kms": s_pct,
+            "kmsr": s_reset,
+            "kmw": w_pct,
+            "kmwr": w_reset,
             "kml": 1 if c["lim_valid"] else 0,
             "kmx": {"wk": [round(x, 4) for x in c["daily"]]},
             "kmm": c["model"],
