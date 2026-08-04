@@ -1,12 +1,12 @@
 # clawdmeter-watch.ps1
-# Run the Clawdmeter daemon ONLY while an AI CLI is active, so nothing heavy sits
-# resident when you're not using Claude/Grok/Slate. This watcher is the single
-# always-on piece, and it's featherweight: a Get-Process check every POLL_SEC.
-# The daemon (BLE link + Anthropic poll + Grok log scan) runs solely on demand.
+# Keep the Clawdmeter daemon resident (ALWAYS-ON) and restart it if it dies. The
+# gauge is cabled full-time and the daemon also serves mouse side-button view
+# control, so it no longer gates on AI activity. This watcher stays the single
+# supervisor: featherweight, a liveness check every POLL_SEC.
 #
-# Detection is by process name — claude/grok/slate are distinct native .exes, so
-# this catches every launch method (terminal AND the VS Code extension, which
-# spawns claude.exe just the same). Node is deliberately ignored.
+# (History: it used to run the daemon only while claude/grok/slate were active;
+# the AI-process detection below is retained for logging, but $shouldRun is now
+# always true. Set it back to the gated form to restore on-demand behaviour.)
 #
 # Register at login with register-watch.ps1 (or Task Scheduler). This REPLACES
 # install-windows.ps1's always-on tray autostart — don't run both.
@@ -78,7 +78,10 @@ while ($true) {
     $active = $false
     foreach ($n in $AI_PROCS) { if (Get-Process -Name $n -ErrorAction SilentlyContinue) { $active = $true; break } }
     if ($active) { $lastActive = Get-Date }
-    $shouldRun = $active -or (((Get-Date) - $lastActive).TotalSeconds -lt $GRACE_SEC)
+    # Always-on: the desk gauge is cabled full-time and the daemon now also serves
+    # mouse side-button view control, so keep it resident rather than gating on AI
+    # activity. ($active/$GRACE_SEC kept above for logging/back-compat.)
+    $shouldRun = $true
 
     $running = [bool](Get-DaemonProcs)
     if ($shouldRun -and -not $running) {

@@ -47,6 +47,17 @@ SERIAL_WRITE_TIMEOUT = 5.0
 POLL_INTERVAL = 60
 PORT_RETRY_BACKOFF_CAP = 30  # gentle backoff while the port is absent (device unplugged / reflashing)
 
+# Mouse-button view control: a global low-level hook maps the two thumb side
+# buttons to the device's view cycle (XButton1/Back -> prev, XButton2/Fwd ->
+# next), sending the same "pprev"/"pnext" serial commands the physical side
+# buttons trigger. The hook runs in its own thread (Win32 message pump) and only
+# ENQUEUES commands; the asyncio loop owns the serial port and flushes them, so
+# there is never a cross-thread write. The buttons are consumed (dedicated to the
+# device — they stop acting as browser Back/Forward), per the chosen config.
+import collections
+_view_cmds: "collections.deque[str]" = collections.deque()
+_hook_refs: list = []   # keep the ctypes callback alive (else it's GC'd mid-hook)
+
 # Optional reset chime.
 # Optional clock display. 
 # Config lives under the same Clawdmeter dir as daemon.log.
@@ -1223,9 +1234,87 @@ def _next_backoff(current: int, cap: int) -> int:
     return min(current * 2, cap)
 
 
+def _flush_view_cmds(ser: "serial.Serial") -> None:
+    """Drain queued mouse view commands to the device. Runs only in the asyncio
+    loop (same thread that owns `ser`), so it never races poll_and_send's write.
+    A serial error is swallowed here — the next poll's write will hit it too and
+    the main loop reopens the port."""
+    while _view_cmds:
+        cmd = _view_cmds.popleft()
+        try:
+            ser.write((cmd + "\n").encode())
+            ser.flush()
+            log(f"View cmd -> {cmd}")
+        except (serial.SerialException, OSError) as e:
+            log(f"View cmd write failed ({cmd}): {e}")
+            return
+
+
+def _run_mouse_hook(loop: "asyncio.AbstractEventLoop", view_event: "asyncio.Event") -> None:
+    """Install a global WH_MOUSE_LL hook mapping the thumb side buttons to the
+    device's view cycle, and pump messages. Enqueues "pprev"/"pnext" and wakes the
+    asyncio loop to flush them; consumes the button events (they no longer act as
+    browser Back/Forward). Best-effort: any failure just disables mouse control."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        WH_MOUSE_LL = 14
+        WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
+        XBUTTON1, XBUTTON2 = 0x0001, 0x0002
+        LRESULT = ctypes.c_ssize_t   # LONG_PTR — 64-bit on x64, so the hook chain
+                                     # return value isn't truncated (the err-0 bug)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+        HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HMODULE, wintypes.DWORD]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+
+        def _cb(nCode, wParam, lParam):
+            if nCode == 0 and wParam in (WM_XBUTTONDOWN, WM_XBUTTONUP):
+                ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                btn = (ms.mouseData >> 16) & 0xFFFF
+                if btn in (XBUTTON1, XBUTTON2):
+                    if wParam == WM_XBUTTONDOWN:   # act on press, swallow the release
+                        _view_cmds.append("pprev" if btn == XBUTTON1 else "pnext")
+                        loop.call_soon_threadsafe(view_event.set)
+                    return 1                        # consume — dedicate to the device
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        cb = HOOKPROC(_cb)
+        _hook_refs.append(cb)   # pin against GC for the hook's lifetime
+        hmod = kernel32.GetModuleHandleW(None)
+        hook = user32.SetWindowsHookExW(WH_MOUSE_LL, cb, hmod, 0)
+        if not hook:
+            log(f"Mouse hook install failed (err {ctypes.get_last_error()})")
+            return
+        log("Mouse hook installed: XButton1->prev view, XButton2->next view")
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except Exception as e:  # never let a hook problem take down the daemon
+        log(f"Mouse hook thread error: {e}")
+
+
 async def main(tray_state=None) -> None:
     stop_event = asyncio.Event()
+    view_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    # Global mouse side-button -> view control (Windows only; harmless if it fails).
+    threading.Thread(target=_run_mouse_hook, args=(loop, view_event),
+                     name="mouse-hook", daemon=True).start()
 
     # Populate the shared state object so the tray can route Quit through
     # loop.call_soon_threadsafe (RESEARCH Pitfall 2).  Additive — the existing
@@ -1263,6 +1352,22 @@ async def main(tray_state=None) -> None:
             await asyncio.wait_for(stop_event.wait(), timeout=secs)
         except asyncio.TimeoutError:
             pass
+
+    async def idle_servicing_mouse(secs: float, ser: "serial.Serial") -> None:
+        """Sleep up to `secs` between polls, but wake the moment a mouse side
+        button is pressed and flush the queued view command to the device — so a
+        button press flips the view in ~ms, not up to a poll interval later."""
+        deadline = loop.time() + secs
+        while not stop_event.is_set():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            try:
+                await asyncio.wait_for(view_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return   # normal poll interval elapsed
+            view_event.clear()
+            _flush_view_cmds(ser)
 
     ser = None
     port_backoff = 1
@@ -1311,7 +1416,7 @@ async def main(tray_state=None) -> None:
                 await sleep_or_stop(1)
                 continue
 
-            await sleep_or_stop(POLL_INTERVAL)
+            await idle_servicing_mouse(POLL_INTERVAL, ser)
     finally:
         if ser is not None:
             try:
