@@ -149,6 +149,18 @@ static bool parse_json(const char* json, UsageData* out) {
     for (int i = 0; i < 7; i++) out->kimi_week_series[i] = doc["kmx"]["wk"][i] | 0.0f;
     strlcpy(out->kimi_model, doc["kmm"] | "", sizeof(out->kimi_model));
 
+    // Codex (OpenAI) — absent → no Codex view. "cd"=week $ gates the view; the
+    // 7-day % ("cdw") comes from the newest rate_limits record in the rollout
+    // logs (read locally by the daemon — no token to go stale like Kimi's).
+    out->codex_valid = !doc["cd"].isNull();
+    out->codex_week_usd = doc["cd"] | 0.0f;
+    out->codex_today_usd = doc["cdd"] | 0.0f;
+    out->codex_weekly_pct = doc["cdw"] | 0.0f;
+    out->codex_weekly_reset_mins = doc["cdwr"] | -1;
+    out->codex_series_valid = !doc["cdx"].isNull();
+    for (int i = 0; i < 7; i++) out->codex_week_series[i] = doc["cdx"]["wk"][i] | 0.0f;
+    strlcpy(out->codex_model, doc["cdm"] | "", sizeof(out->codex_model));
+
     // Claude model-scoped weekly limit (Weekly-Fable/Opus) — absent → device hides it.
     out->scoped_weekly_valid = !doc["kw"].isNull();
     out->scoped_weekly_pct = doc["kw"] | 0.0f;
@@ -248,9 +260,9 @@ static bool process_usage_json(const char* json) {
 // connected, the daemon streams the same JSON over USB serial (a line starting
 // with '{') instead of writing the BLE RX characteristic.
 // Phase B adds vitals (per-core array + device names) + the three Claude limits +
-// Grok/Claude 7-day series to the payload — a full line runs ~620 B, so the 512 B
-// that held the base payload is no longer enough. 1024 leaves comfortable headroom.
-#define CMD_BUF_SIZE 1024
+// Grok/Claude 7-day series to the payload; Kimi and Codex then pushed a full line
+// to ~950 B worst-case — past the old 1024's comfort zone. 1280 leaves headroom.
+#define CMD_BUF_SIZE 1280
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -422,6 +434,10 @@ void setup() {
         f.kimi_weekly_pct  = 12; f.kimi_weekly_reset_mins  = 9878;
         f.kimi_week_usd = 34;  f.kimi_today_usd = 6.8f;
         strlcpy(f.kimi_model, "K3", sizeof(f.kimi_model));
+        f.codex_valid = true;
+        f.codex_weekly_pct = 7;  f.codex_weekly_reset_mins = 9993;
+        f.codex_week_usd = 65;   f.codex_today_usd = 65;
+        strlcpy(f.codex_model, "5.6 SOL", sizeof(f.codex_model));
         f.ok = true; f.valid = true;
         // Seed the session sparkline with a fake wobbly climb so QA screenshots
         // show a trend line, not a single point.

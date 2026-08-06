@@ -43,6 +43,8 @@
 #define PC_CLAUDE   lv_color_hex(0xd97757)   // Anthropic coral — all Claude gauges
 #define PC_GROK     lv_color_hex(0x2b4fe0)   // deep royal blue — all Grok gauges
 #define PC_KIMI     lv_color_hex(0x1783ff)   // Moonshot Kimi blue — Kimi mark/spark
+#define PC_CODEX    lv_color_hex(0x10a37f)   // OpenAI teal — Codex mark/spark (hue
+                                             // 167°, clear of PC_GREEN's ok band 145°)
 // Model chips/segments — one violet family (near Fable), spaced enough to read
 // apart. Rings no longer use these (they're heat-tiered); these are model identity.
 #define PC_OPUS     lv_color_hex(0x8b5cf6)   // vivid violet (flagship)

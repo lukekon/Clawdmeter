@@ -74,6 +74,19 @@ struct UsageData {
     bool kimi_series_valid;      // "kmx" present → 7-day Kimi $ series available
     float kimi_week_series[7];   // 7-day daily $ activity (index 6 = today)
     char kimi_model[16];         // model in use now (e.g. "K3"); "" = idle
+    // Codex (OpenAI) activity + weekly limit from the daemon — both read locally
+    // from Codex's rollout logs (no endpoint, no token). $ figures are estimated
+    // at API rates — a gauge, not a bill (the Codex plan is flat-rate). Codex
+    // exposes only a 7-day window (no session/daily one), so the view is
+    // single-ring like Grok. Absent → the device hides the Codex view.
+    bool codex_valid;            // "cd" field present → the device can show a Codex view
+    float codex_weekly_pct;      // 7-day window utilisation % (0-100)
+    int codex_weekly_reset_mins; // minutes until the 7d window resets (-1 = unknown)
+    float codex_week_usd;        // Codex spend this week, $ at API rates
+    float codex_today_usd;       // ...today
+    bool codex_series_valid;     // "cdx" present → 7-day Codex $ series available
+    float codex_week_series[7];  // 7-day daily $ activity (index 6 = today)
+    char codex_model[16];        // model in use now (e.g. "5.6 SOL"); "" = idle
     // Claude's model-scoped weekly limit (the "Weekly Fable"/"Weekly Opus" wall) —
     // NOT in the Messages-API headers; read from /api/oauth/usage. Absent → hide it.
     bool scoped_weekly_valid;

@@ -569,6 +569,186 @@ async def fetch_kimi_usage() -> dict:
         return {}
 
 
+# --- Codex (OpenAI) activity + weekly limit ---------------------------------
+# One plane, fully local (unlike Kimi there is no token to go stale): both the
+# $ activity and the weekly-limit % come from Codex's own rollout logs under
+# ~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl — one JSONL per session.
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_SESSIONS = CODEX_HOME / "sessions"
+# $ per 1M tokens (input, output, cacheRead). gpt-5.6 family, verified
+# 2026-08-06; keep in sync with PitCrew's lib/usage-rates.ts. Longest prefix
+# first, like XAI_RATES.
+CODEX_RATES = [
+    ("gpt-5.6-sol", (5.0, 30.0, 0.50)),
+    ("gpt-5.6-terra", (2.0, 12.0, 0.20)),
+    ("gpt-5.6-luna", (0.20, 1.20, 0.02)),
+]
+CODEX_RECOMPUTE_S = 300
+# Reset stored as an ABSOLUTE epoch (b24e57a): minutes-until is recomputed fresh
+# on every poll so the countdown never freezes between log writes.
+_codex_cache = {"ts": 0.0, "week": 0.0, "today": 0.0, "daily": [0.0] * 7, "model": "",
+                "w_pct": 0, "w_reset_epoch": None, "w_window_min": 10080}
+
+
+def _codex_label(model: str) -> str:
+    """'gpt-5.6-sol' → '5.6 SOL'. Compact chip label; generic so a new gpt model
+    needs no code change (the 'gpt-' prefix is dropped — the view already says
+    Codex)."""
+    seg = (model or "").split("/")[-1]
+    if seg.lower().startswith("gpt-"):
+        seg = seg[4:]
+    return seg.upper().replace("-", " ")[:10] if seg else ""
+
+
+def _codex_cost(model: str, fresh: int, output: int, cached: int) -> float:
+    """$ at API rates for one Codex turn, or 0 for an unknown model. `fresh` is
+    already the non-cached input (see the subset note in _recompute_codex)."""
+    for prefix, (ci, co, cc) in CODEX_RATES:
+        if model.startswith(prefix):
+            return (fresh * ci + output * co + cached * cc) / 1_000_000.0
+    return 0.0
+
+
+def _recompute_codex() -> tuple[float, float, list, str, dict]:
+    """Scan the local Codex rollout logs for this week's / today's $ activity,
+    the model in use now, and the live weekly limit.
+
+    Usage lives on `event_msg` records whose payload.type is `token_count`; use
+    payload.info.last_token_usage (the per-API-call delta) — NEVER sum
+    total_token_usage, a cumulative snapshot that resets on compaction. Token
+    buckets carry the same subset trap as Grok: cached_input_tokens is a SUBSET
+    of input_tokens, so fresh input = input - cached (billing it as-is would
+    massively overstate cost); reasoning_output_tokens is already inside
+    output_tokens (do not add); cache_write_input_tokens is 0 in practice.
+
+    token_count carries NO model — the model lives on `turn_context` records.
+    Forked sub-agent rollouts bury their token_counts BEFORE the only
+    turn_context, so per-position attribution is impossible: a file's events are
+    attributed to the file's FIRST turn_context model, or (files with none —
+    e.g. Codex Desktop sessions) to the newest turn_context model seen anywhere.
+
+    The weekly limit rides the same records: payload.rate_limits = {primary:
+    {used_percent, window_minutes, resets_at}, secondary: null, ...}. We take the
+    NEWEST token_count with a non-null rate_limits (sub-agent files carry
+    rate_limits: null — skip those). Codex exposes only the 7-day window
+    (secondary is null), so there is no session/daily ring. Files older than the
+    week are skipped whole. Returns (week$, today$, daily[7], in_use_label,
+    limits)."""
+    now = time.time()
+    week_cut = now - 7 * 86400
+    lt = time.localtime(now)
+    today_cut = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    week = today = 0.0
+    daily = [0.0] * 7  # index 6 = today
+    files = []          # (file_model, [(ts, fresh, output, cached), ...])
+    newest_ctx_ts, newest_ctx_model = 0.0, ""
+    lim_ts, limits = 0.0, {}
+
+    try:
+        rollouts = list(CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"))
+    except OSError:
+        rollouts = []
+    for f in rollouts:
+        try:
+            if f.stat().st_mtime < week_cut:
+                continue
+            file_model, events = "", []
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"token_count"' not in line and '"turn_context"' not in line:
+                        continue  # cheap prefilter over a big log
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    ts = _iso_to_epoch(rec.get("timestamp"))
+                    if not ts:
+                        continue
+                    if rec.get("type") == "turn_context":
+                        model = ((rec.get("payload") or {}).get("model")) or ""
+                        if model:
+                            if not file_model:
+                                file_model = model
+                            if ts > newest_ctx_ts:
+                                newest_ctx_ts, newest_ctx_model = ts, model
+                        continue
+                    payload = rec.get("payload") or {}
+                    if payload.get("type") != "token_count":
+                        continue
+                    u = ((payload.get("info") or {}).get("last_token_usage")) or {}
+                    if u:
+                        cached = u.get("cached_input_tokens") or 0
+                        fresh = max(0, (u.get("input_tokens") or 0) - cached)
+                        events.append((ts, fresh, u.get("output_tokens") or 0, cached))
+                    rl = payload.get("rate_limits") or {}
+                    primary = rl.get("primary") or {}
+                    if primary.get("used_percent") is not None and ts >= lim_ts:
+                        lim_ts = ts
+                        limits = {"w_pct": max(0, min(100, int(round(primary["used_percent"])))),
+                                  "w_reset_epoch": primary.get("resets_at"),
+                                  "w_window_min": primary.get("window_minutes") or 10080}
+            files.append((file_model, events))
+        except OSError:
+            continue
+
+    last_ev_ts, last_ev_model = 0.0, ""
+    for file_model, events in files:
+        model = file_model or newest_ctx_model  # no turn_context → machine's model
+        for ts, fresh, output, cached in events:
+            if ts > last_ev_ts:
+                last_ev_ts, last_ev_model = ts, model
+            cost = _codex_cost(model, fresh, output, cached)
+            if cost <= 0:
+                continue
+            if ts >= week_cut:
+                week += cost
+            if ts >= today_cut:
+                today += cost
+            idx = 6 + int((ts - today_cut) // 86400)
+            if 0 <= idx < 7:
+                daily[idx] += cost
+
+    # "In use now" = the model behind the most recent token event, but only if
+    # it's recent (a session running now), else idle — same spirit as the Kimi chip.
+    model = _codex_label(last_ev_model) if last_ev_ts and (now - last_ev_ts) <= 900 else ""
+    return week, today, daily, model, limits
+
+
+async def fetch_codex_usage() -> dict:
+    """Codex fields for the payload, cached for CODEX_RECOMPUTE_S:
+      cd/cdd   = week/today $ activity (API rates — a gauge, not a bill)
+      cdw/cdwr = 7-day window % + reset (mins), from the newest rate_limits record
+      cdx      = 7-day $ activity series for the sparkline (index 6 = today)
+      cdm      = model in use now (e.g. "5.6 SOL"), "" when idle
+    Returns {} (device hides the Codex view) only when there is no signal at all."""
+    try:
+        now = time.time()
+        if now - _codex_cache["ts"] >= CODEX_RECOMPUTE_S:
+            week, today, daily, model, lim = _recompute_codex()
+            _codex_cache.update(ts=now, week=week, today=today, daily=daily, model=model)
+            if lim:
+                _codex_cache.update(lim)  # refresh last-good
+        c = _codex_cache
+        # Age the last-good limit off wall-clock: the countdown ticks down, and a
+        # rolled window (reset epoch passed with no new log writes) zeroes the %
+        # and advances to the next boundary — same projection as the Kimi view.
+        w_pct, w_reset = _project_window(c["w_pct"], c["w_reset_epoch"], c["w_window_min"], now)
+        if (c["week"] == 0 and c["today"] == 0
+                and not w_pct and c["w_reset_epoch"] is None):
+            return {}   # Codex never used and no limit ever read → no view
+        return {
+            "cd": round(c["week"]),
+            "cdd": round(c["today"]),
+            "cdw": w_pct,
+            "cdwr": w_reset,
+            "cdx": {"wk": [round(x, 4) for x in c["daily"]]},
+            "cdm": c["model"],
+        }
+    except Exception as e:
+        log(f"Codex usage compute failed: {e}")
+        return {}
+
+
 # --- Claude model-scoped weekly limit (Weekly-Fable / Weekly-Opus) ----------
 # The Messages-API rate-limit headers expose ONLY the all-models 5h + 7d limits.
 # The separate heavy-model weekly cap (the "Weekly Fable" 92% wall Luke sees on
@@ -1054,6 +1234,7 @@ async def poll_api(token: str) -> dict | None:
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     payload.update(await fetch_grok_usage())  # adds "g"/"gd" iff PitCrew is up
     payload.update(await fetch_kimi_usage())  # adds "km"* iff Kimi has any signal
+    payload.update(await fetch_codex_usage())  # adds "cd"* iff Codex has any signal
     return payload
 
 

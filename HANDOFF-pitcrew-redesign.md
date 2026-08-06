@@ -68,7 +68,7 @@ language**. Think: a small, honest, elegant system/AI dashboard on the desk.
 - **Navigation:** the physical **left/right buttons cycle views** (via
   `ui_cycle_view()` → `proto_cycle()`); a **page-dot footer** shows position.
 - **Placeholder data** — static mock values (Ryzen 9 5900X, RTX 3080 Ti, etc.).
-- **Screenshot seam:** serial command `pview <n>` jumps to a view (0–3) so it can
+- **Screenshot seam:** serial command `pview <n>` jumps to a view (0–7) so it can
   be captured over USB without pressing buttons.
 
 ### Design history (don't repeat these)
@@ -105,7 +105,7 @@ $pio = "$env:APPDATA\Python\Python314\Scripts\pio.exe"
 Get-CimInstance Win32_Process | ? { $_.ProcessId -ne $PID -and ($_.CommandLine -like '*claude_usage_daemon*' -or $_.CommandLine -like '*clawdmeter-watch*') } | % { Stop-Process -Id $_.ProcessId -Force }
 & $pio run -d firmware -e waveshare_amoled_216 -t upload --upload-port COM3
 
-# Screenshot a view (0–3) over USB, non-resetting. shot.py opens COM3 with
+# Screenshot a view (0–7) over USB, non-resetting. shot.py opens COM3 with
 # DTR/RTS de-asserted (a plain open resets the ESP32 to splash), sends `pview N`,
 # then the `screenshot` serial cmd, and saves an RGB565-LE framebuffer as PNG.
 & C:\Users\konis\Clawdmeter\.venv\Scripts\python.exe shot.py out.png 0
