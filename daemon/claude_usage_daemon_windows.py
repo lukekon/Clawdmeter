@@ -1437,6 +1437,29 @@ def _read_expiry() -> str:
     return "expiry unknown"
 
 
+async def _send_local_only(ser: "serial.Serial") -> None:
+    """Stream just the locally-computed fields (Grok/Kimi/Codex + vitals).
+
+    The payload's Claude fields ride on the OAuth poll, so the old all-or-
+    nothing path sent NOTHING while the Claude token was dead — and the desk
+    gauge sat on its boot placeholders, which look like live numbers. The
+    other providers read LOCAL logs (no token), so keep them flowing; the
+    firmware reads the absent "ok" as Claude-view no-data. Best-effort: a
+    build failure sends nothing, same as before.
+    """
+    try:
+        payload: dict = {}
+        payload.update(await fetch_grok_usage())
+        payload.update(await fetch_kimi_usage())
+        payload.update(await fetch_codex_usage())
+        payload.update(read_vitals())
+    except Exception as e:
+        log(f"local-only payload build failed: {e}")
+        return
+    if payload:
+        write_payload(ser, payload)   # raises on a dead port — main loop reopens
+
+
 async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
     """Poll the API once and stream the payload over the serial link.
 
@@ -1449,13 +1472,16 @@ async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
         log("No token; skipping poll")
         if tray_state:
             tray_state.set_error("token expired — run claude login")
+        await _send_local_only(ser)
         return
     try:
         payload = await poll_api(token)
     except AuthError:
-        # Real 401/403 — token genuinely needs a refresh.
+        # Real 401/403 — token genuinely needs a refresh. Claude's fields die
+        # with it; the local providers must keep streaming (see the helper).
         if tray_state:
             tray_state.set_error("token expired — run claude login")
+        await _send_local_only(ser)
         return
     if payload is None:
         # Transient failure (network/DNS, timeout, rate-limit, 5xx). poll_api

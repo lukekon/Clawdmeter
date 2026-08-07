@@ -67,7 +67,11 @@ language**. Think: a small, honest, elegant system/AI dashboard on the desk.
   black air — one metric domain per screen.
 - **Navigation:** the physical **left/right buttons cycle views** (via
   `ui_cycle_view()` → `proto_cycle()`); a **page-dot footer** shows position.
-- **Placeholder data** — static mock values (Ryzen 9 5900X, RTX 3080 Ti, etc.).
+- **Placeholder data** — static mock values (Ryzen 9 5900X, RTX 3080 Ti, etc.)
+  render **only in UI_SHOT QA builds**; in production each AI view short-circuits
+  to a drawn-dash **NO LIVE DATA** state when its provider's gate is false (a dead
+  Claude token → local-only payload → Claude view alone drops out). A desk gauge
+  must never present invented numbers as live.
 - **Screenshot seam:** serial command `pview <n>` jumps to a view (0–7) so it can
   be captured over USB without pressing buttons.
 

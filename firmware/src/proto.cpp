@@ -75,13 +75,18 @@ static const float WEEK_GROK[7]   = { 0.12f, 0.18f, 0.09f, 0.28f, 0.15f, 0.22f, 
 // proto_update() stashes the latest payload; the views read through the accessors
 // below, which fall back to the placeholder constants above whenever a field is
 // absent (no daemon yet / partial payload) so screenshot QA still renders.
+// Production builds never surface those constants: each AI view short-circuits
+// to no_data() when its own provider gate is false.
 static UsageData s_d;
 static bool      s_has = false;
 
 static bool hcpu() { return s_has && s_d.vitals.cpu_valid; }
 static bool hgpu() { return s_has && s_d.vitals.gpu_valid; }
 static bool hram() { return s_has && s_d.vitals.ram_valid; }
-static bool hcl()  { return s_has && s_d.valid; }
+// Claude's fields exist only when the daemon's OAuth poll succeeded ("ok");
+// a dead token sends the local-only payload without them, and parsed zero
+// defaults must not read as a real 0% — the Claude view alone drops to no-data.
+static bool hcl()  { return s_has && s_d.valid && s_d.ok; }
 
 static float cpu_pct() { return hcpu() ? (float)s_d.vitals.cpu_pct : CPU_PCT; }
 static float gpu_pct() { return hgpu() ? (float)s_d.vitals.gpu_pct : GPU_PCT; }
@@ -89,7 +94,10 @@ static float ram_pct() { return hram() ? (float)s_d.vitals.ram_pct : RAM_PCT; }
 
 static float cl_session()   { return hcl() ? s_d.session_pct : CLAUDE_SESSION; }
 static float cl_weekly()    { return hcl() ? s_d.weekly_pct  : CLAUDE_WEEKLY; }
-static float grok_pct()     { return hcl() ? s_d.grok_week_pct : GROK_WEEKLY; }
+// Grok gates on ITS OWN flag ("g" present) — it rode hcl() until the dead-
+// Claude-token payload made that mean "Claude is live" and blanked Grok too.
+static bool  hgr()          { return s_has && s_d.valid && s_d.grok_valid; }
+static float grok_pct()     { return hgr() ? s_d.grok_week_pct : GROK_WEEKLY; }
 static bool  hki()          { return s_has && s_d.valid && s_d.kimi_valid; }
 static float ki_session()   { return hki() ? s_d.kimi_session_pct : KIMI_SESSION; }
 static float ki_weekly()    { return hki() ? s_d.kimi_weekly_pct  : KIMI_WEEKLY; }
@@ -832,6 +840,17 @@ static lv_obj_t* model_chip(lv_obj_t* parent, const char* name, lv_color_t col,
     return c;
 }
 
+// Idle marker for the IN USE row — a DRAWN dash, not the U+2014 glyph (the
+// bundled fonts lack it; it renders as a box — HANDOFF §3).
+static void dash_chip(lv_obj_t* row) {
+    lv_obj_t* d = lv_obj_create(row);
+    lv_obj_remove_style_all(d);
+    lv_obj_set_size(d, 18, 4);
+    lv_obj_set_style_bg_color(d, PC_GREY, 0);
+    lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(d, LV_OBJ_FLAG_SCROLLABLE);
+}
+
 // "IN USE" + one chip per model running now (parallel sessions → several chips).
 static void inuse_chips(lv_obj_t* scr, int y) {
     lv_obj_t* row = crow(scr, y, 14);
@@ -844,7 +863,7 @@ static void inuse_chips(lv_obj_t* scr, int y) {
         model_chip(row, "OPUS 4.8", PC_OPUS, 14, &font_styrene_24);
         model_chip(row, "FABLE 5",  PC_FABLE, 14, &font_styrene_24);
     } else {
-        rtext(row, "\xE2\x80\x94", PC_GREY, &font_styrene_28);  // idle: nothing recent
+        dash_chip(row);  // idle: nothing recent
     }
 }
 
@@ -900,6 +919,23 @@ static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
     lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y);
 }
 
+// Honest no-data state, production builds only (UI_SHOT keeps the placeholder
+// constants so QA screenshots still render populated views): a provider with
+// no live reading gets this instead of invented numbers — the placeholder
+// constants once read as live Kimi quota for a whole afternoon (61%/12%
+// while kimi.com said 11%/87%). The dash is DRAWN (a bar): the bundled fonts
+// have no U+2014 glyph — it renders as a box (see HANDOFF §3).
+static void no_data(lv_obj_t* scr) {
+    lv_obj_t* bar = lv_obj_create(scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, 56, 6);
+    lv_obj_set_style_bg_color(bar, PC_GREY, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 210);
+    lv_obj_t* t = rtext(crow(scr, 260, 0), "NO LIVE DATA", PC_DIM, &font_styrene_24);
+    lv_obj_set_style_text_letter_space(t, 3, 0);
+}
+
 // CLAUDE — the two all-model limits as heat-tiered rings (Session 5h · Weekly 7d),
 // then the same footer as the Grok view (models-in-use · today's $ · 7-day spark).
 // Intentionally a mirror of view_grok with one extra ring — the model-scoped
@@ -908,6 +944,9 @@ static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
 static void view_claude(lv_obj_t* scr) {
     chrome(scr, nullptr);
     header_mascot(scr);
+#ifndef UI_SHOT
+    if (!hcl()) { no_data(scr); return; }
+#endif
     const int W = board_caps().width;
 
     // ── Dual arcs: SESSION (5h) left, WEEKLY (7d) right ──────────────────────
@@ -960,6 +999,9 @@ static void view_claude(lv_obj_t* scr) {
 static void view_codex(lv_obj_t* scr) {
     chrome(scr, nullptr);
     header_codex_logo(scr);
+#ifndef UI_SHOT
+    if (!hcd()) { no_data(scr); return; }
+#endif
     const int W = board_caps().width;
     const int AS = AI_GAUGE_AS, ay = AI_GAUGE_Y;
     const int ax = (W - AS) / 2;
@@ -980,7 +1022,7 @@ static void view_codex(lv_obj_t* scr) {
         lv_obj_set_style_text_letter_space(lbl, 3, 0);
         const char* m = (hcd() && s_d.codex_model[0]) ? s_d.codex_model : "5.6 SOL";
         if (hcd() && !s_d.codex_model[0])
-            rtext(row, "\xE2\x80\x94", PC_GREY, &font_styrene_28);  // idle
+            dash_chip(row);  // idle
         else
             model_chip(row, m, PC_CODEX, 14, &font_styrene_24);
     }
@@ -1005,6 +1047,9 @@ static void view_codex(lv_obj_t* scr) {
 static void view_kimi(lv_obj_t* scr) {
     chrome(scr, nullptr);
     header_kimi_logo(scr);
+#ifndef UI_SHOT
+    if (!hki()) { no_data(scr); return; }
+#endif
     const int W = board_caps().width;
 
     // Identical ring geometry to view_claude (ay=76 keeps the 80px corner mark off
@@ -1032,7 +1077,7 @@ static void view_kimi(lv_obj_t* scr) {
         lv_obj_set_style_text_letter_space(lbl, 3, 0);
         const char* m = (hki() && s_d.kimi_model[0]) ? s_d.kimi_model : "K3";
         if (hki() && !s_d.kimi_model[0])
-            rtext(row, "\xE2\x80\x94", PC_GREY, &font_styrene_28);  // idle
+            dash_chip(row);  // idle
         else
             model_chip(row, m, PC_KIMI, 14, &font_styrene_24);
     }
@@ -1054,6 +1099,9 @@ static void view_kimi(lv_obj_t* scr) {
 static void view_grok(lv_obj_t* scr) {
     chrome(scr, nullptr);
     header_grok_logo(scr);
+#ifndef UI_SHOT
+    if (!hgr()) { no_data(scr); return; }
+#endif
     const int W = board_caps().width;
     const int AS = AI_GAUGE_AS, ay = AI_GAUGE_Y;
     const int ax = (W - AS) / 2;
@@ -1065,7 +1113,7 @@ static void view_grok(lv_obj_t* scr) {
     job_arc(scr, ax, ay, AS, gw / 100.0f, band(gw), 20, false);
     pct_col(scr, (int)(gw + 0.5f), cx, ay + 72, &font_departure_72);
     brow_col(scr, "WEEKLY", cx, ay + 150);
-    reset_col(scr, hcl() ? s_d.grok_week_reset_mins : 6400, cx, ay + 184);
+    reset_col(scr, hgr() ? s_d.grok_week_reset_mins : 6400, cx, ay + 184);
 
     // IN USE — same size/style as the Claude view.
     {
@@ -1080,14 +1128,14 @@ static void view_grok(lv_obj_t* scr) {
     // figure reads as history without needing a label at an unreadable size.
     {
         char spend[16] = "$18.60";
-        if (hcl()) snprintf(spend, sizeof spend, "$%.2f", s_d.grok_today_usd);
+        if (hgr()) snprintf(spend, sizeof spend, "$%.2f", s_d.grok_today_usd);
         lv_obj_t* row = crow(scr, 350, 12);
         rtext(row, spend, PC_TEXT, &font_departure_48);
         lv_obj_t* t = rtext(row, "TODAY", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
     }
     float sk[7];
-    const float* grok_sk = (hcl() && s_d.grok_series_valid) ? norm7(s_d.grok_week_series, sk)
+    const float* grok_sk = (hgr() && s_d.grok_series_valid) ? norm7(s_d.grok_week_series, sk)
                                                             : nullptr;
     job_spark(scr, 32, 412, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
 }
