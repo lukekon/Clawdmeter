@@ -116,22 +116,21 @@ struct UsageData {
     int   wx_humidity, wx_wind;
     char  wx_sunrise[8], wx_sunset[8];   // local "5:52" / "7:56"
     int   wx_daylight_pct;       // 0-100 through the daylight span; drives the hero arc
+    int   wx_hour0;              // clock hour (0-23) the hourly list starts at
     int   wx_nhours;
     float wx_hourly[12];         // next 12 hours, °F
     float wx_precip[12];         // ...and their precipitation probability, %
     // Market ("mk", Yahoo). $ moves are live prices; the holdings roster behind
     // the movers comes from Monarch and is refreshed out of band.
     bool  mk_valid;
-    int   mk_nix;                // index chips (S&P / NDX / RUT)
-    char  mk_ix_name[3][8];
+    int   mk_nix;                // index rows (S&P 500 / NASDAQ / RUSSELL)
+    char  mk_ix_name[3][12];
     float mk_ix_price[3];
     float mk_ix_pct[3];
-    int   mk_nspark;
-    float mk_spark[32];          // hero index intraday, normalised 0-1 …
-    float mk_baseline;           // …with the prior close on the SAME scale
     int   mk_nmv;
-    char  mk_mv_sym[3][8];       // today's top movers by % (Luke's ranking)
+    char  mk_mv_sym[3][12];      // today's top movers by % (Luke's ranking)
     float mk_mv_pct[3];
+    float mk_mv_price[3];
     char  mk_status[8];          // "OPEN" / "CLOSED"; "" = unknown
     int   mk_countdown_mins;     // to the close when open, to the next open when shut
     Vitals vitals;               // CPU / GPU / RAM machine telemetry

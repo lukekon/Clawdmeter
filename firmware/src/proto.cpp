@@ -1059,19 +1059,6 @@ static void draw_weather_glyph(uint16_t* b, int D, int code, bool is_day) {
     }
 }
 
-// Market direction mark: a solid triangle, up green / down red.
-static void draw_triangle(uint16_t* b, int D, bool up, lv_color_t col) {
-    for (int i = 0; i < D * D; i++) b[i] = 0x0000;
-    const uint16_t c = lv_color_to_u16(col);
-    const int pad = D / 8, span = D - 2 * pad;
-    for (int r = 0; r < span; r++) {
-        const float t = (float)r / (span - 1);          // 0 at the apex row
-        const int half = (int)(t * span / 2.0f);
-        const int y = up ? pad + r : D - pad - 1 - r;
-        for (int x = D / 2 - half; x <= D / 2 + half; x++) px565(b, D, x, y, c);
-    }
-}
-
 // Degree ring — a small hollow superscript circle. The bundled fonts have no
 // U+00B0 (it renders as a box), so the unit is drawn, like the clock face.
 static void degree_mark(lv_obj_t* row, lv_color_t col, int d) {
@@ -1322,39 +1309,105 @@ static void view_grok(lv_obj_t* scr) {
     job_spark(scr, 32, 412, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
 }
 
-// WEATHER — the hero ring is the DAYLIGHT span (sunrise → sunset, filled to
-// now), so the arc, the condition word under the numeral and the sunset time in
-// the arc's open bottom are all about the same thing: the sun. Temperature is
-// the numeral because that's the question you actually walk over to ask. Below
-// it, the next 12 hours as heat-ramped columns and a rain-chance lane — the
-// shape of the rest of the day without a single axis label.
+// WEATHER — no gauge. Four views already open with a 270-degree ring and Luke
+// was right that a fifth would be wallpaper; the first cut also ended in a row
+// of dithered columns, which he cut too. So this view is editorial rather than
+// instrumented: the sky itself is the hero at 180px, the temperature reads
+// beside it like a headline, and everything below is plain type on a hairline
+// grid. It is the one view on the device with no dithered form at all, which is
+// exactly what makes it legible as "not the machine, the world outside".
+static void hour_label(char* out, size_t n, int hour24) {
+    const int h = hour24 % 24;
+    const int h12 = (h % 12) == 0 ? 12 : (h % 12);
+    snprintf(out, n, "%d%c", h12, h < 12 ? 'A' : 'P');
+}
+
+// label above, value below, centred on cx — the grid both lower rows share.
+static void wx_cell(lv_obj_t* scr, int cx, int y, const char* label,
+                    const char* value, lv_color_t vcol, bool degree) {
+    lv_obj_t* l = rtext(scr, label, PC_DIM, &font_styrene_20);
+    lv_obj_set_style_text_letter_space(l, 3, 0);
+    lv_obj_update_layout(l);
+    lv_obj_set_pos(l, cx - lv_obj_get_width(l) / 2, y);
+
+    lv_obj_t* row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(row, 3, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    rtext(row, value, vcol, &font_departure_32);
+    if (degree) degree_mark(row, PC_DIM, 10);
+    lv_obj_update_layout(row);
+    lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y + 26);
+}
+
+static void wx_rule(lv_obj_t* scr, int y, int W) {
+    lv_obj_t* hr = lv_obj_create(scr);
+    lv_obj_remove_style_all(hr);
+    lv_obj_set_size(hr, W - 52, 1);
+    lv_obj_set_style_bg_color(hr, PC_HAIR, 0);
+    lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(hr, 26, y);
+}
+
 static void view_weather(lv_obj_t* scr) {
-    chrome(scr, nullptr);
+    chrome(scr, "WEATHER");
     const int W = board_caps().width;
     const bool day = !hwx() || s_d.wx_is_day;
     const int code = hwx() ? s_d.wx_code : 0;
-
-    // Header mark: the drawn condition glyph, same corner and size as the AI
-    // provider marks so the views feel like one family.
-    {
-        const int D = 96;
-        uint16_t* b = mkbuf(D, D);
-        if (b) {
-            draw_weather_glyph(b, D, code, day);
-            canvas_at(scr, b, D, D, 14, 8);
-        }
-    }
 #ifndef UI_SHOT
     if (!hwx()) { no_data(scr); return; }
 #endif
 
-    const int AS = AI_GAUGE_AS, ay = AI_GAUGE_Y;
-    const int ax = (W - AS) / 2, cx = ax + AS / 2;
-    const float dl = hwx() ? s_d.wx_daylight_pct : 64;
-    job_arc(scr, ax, ay, AS, dl / 100.0f, day ? PC_SUN : PC_NIGHT, 20, false);
+    // Sun times, top-right: the drawn half-sun over a horizon, then the clock
+    // time. Before dawn it shows the sunrise instead — the next event, not a
+    // time that already passed.
+    {
+        const bool before_dawn = hwx() && s_d.wx_daylight_pct <= 0 && day;
+        const char* when = hwx() ? (before_dawn ? s_d.wx_sunrise : s_d.wx_sunset) : "7:56";
+        lv_obj_t* row = lv_obj_create(scr);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        const int D = 30;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            for (int i = 0; i < D * D; i++) b[i] = 0x0000;
+            const uint16_t c = lv_color_to_u16(PC_DIM);
+            const float dome_y = D * 0.58f, r = D * 0.26f;
+            disc(b, D, D / 2.0f, dome_y, r, PC_DIM);
+            for (int y = (int)dome_y; y < D; y++)
+                for (int x = 0; x < D; x++) px565(b, D, x, y, 0x0000);
+            for (int x = 0; x < D; x++) {
+                px565(b, D, x, (int)dome_y + 4, c);
+                px565(b, D, x, (int)dome_y + 5, c);
+            }
+            lv_obj_t* cv = lv_canvas_create(row);
+            lv_canvas_set_buffer(cv, b, D, D, LV_COLOR_FORMAT_RGB565);
+        }
+        rtext(row, when, PC_DIM, &font_departure_32);
+        lv_obj_update_layout(row);
+        lv_obj_set_pos(row, W - 26 - lv_obj_get_width(row), 14);
+    }
 
-    // Temperature nested in the ring: numeral centred on the DIGITS with the
-    // drawn degree ring hanging right, the same trick pct_col plays with "%".
+    // The sky, big. 180px is the largest mark on the device by a distance, and
+    // deliberately so — at a glance across the room the glyph IS the reading.
+    {
+        const int D = 180;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            draw_weather_glyph(b, D, code, day);
+            canvas_at(scr, b, D, D, 18, 66);
+        }
+    }
+
+    // Temperature as a headline beside it, with the condition word beneath.
     {
         const float t = hwx() ? s_d.wx_temp : 86;
         char n[8];
@@ -1366,224 +1419,168 @@ static void view_weather(lv_obj_t* scr) {
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_set_style_pad_column(row, 6, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_t* num = rtext(row, n, PC_TEXT, &font_departure_72);
-        degree_mark(row, PC_DIM, 18);
-        lv_obj_update_layout(row);
-        lv_obj_set_pos(row, cx - lv_obj_get_width(num) / 2, ay + 60);
-    }
-    brow_col(scr, wx_word(code, day), cx, ay + 150);
-    // Sunset (or sunrise before dawn) in the arc's open bottom — the slot the AI
-    // views give their reset countdown.
-    {
-        const bool before_dawn = hwx() && s_d.wx_daylight_pct <= 0 && day;
-        const char* when = hwx() ? (before_dawn ? s_d.wx_sunrise : s_d.wx_sunset) : "7:56";
-        lv_obj_t* row = crow(scr, ay + 184, 10);
-        // Half sun sitting ABOVE a horizon rule, with a clear gap between them
-        // and three rays. The first cut had the dome touching the line at 26px,
-        // which merged into an anonymous grey blob.
-        const int D = 32;
-        uint16_t* b = mkbuf(D, D);
-        if (b) {
-            for (int i = 0; i < D * D; i++) b[i] = 0x0000;
-            const uint16_t c = lv_color_to_u16(PC_DIM);
-            const float dome_y = D * 0.60f, r = D * 0.26f;
-            disc(b, D, D / 2.0f, dome_y, r, PC_DIM);
-            for (int y = (int)dome_y; y < D; y++)                       // keep the top half
-                for (int x = 0; x < D; x++) px565(b, D, x, y, 0x0000);
-            for (int i = -1; i <= 1; i++)                               // three rays
-                stroke(b, D, D / 2.0f + i * r * 1.15f, dome_y - r * (i ? 1.20f : 1.55f),
-                       D / 2.0f + i * r * 1.45f, dome_y - r * (i ? 1.55f : 2.00f),
-                       2.0f, PC_DIM);
-            for (int x = 0; x < D; x++) {                               // horizon, below a gap
-                px565(b, D, x, (int)dome_y + 4, c);
-                px565(b, D, x, (int)dome_y + 5, c);
-            }
-            lv_obj_t* cv = lv_canvas_create(row);
-            lv_canvas_set_buffer(cv, b, D, D, LV_COLOR_FORMAT_RGB565);
-        }
-        rtext(row, when, PC_DIM, &font_departure_32);
+        rtext(row, n, temp_color(t), &font_departure_72);
+        degree_mark(row, PC_DIM, 20);
+        lv_obj_set_pos(row, 222, 96);
+
+        lv_obj_t* w = rtext(scr, wx_word(code, day), PC_DIM, &font_styrene_28);
+        lv_obj_set_style_text_letter_space(w, 4, 0);
+        lv_obj_set_pos(w, 224, 186);
     }
 
-    // Footer, on the AI views' rhythm: one value row, then two dithered forms.
+    wx_rule(scr, 250, W);
+
+    // Today's envelope: what it feels like now, and the day's ends.
     {
-        char n[8];
-        snprintf(n, sizeof n, "%d", (int)lroundf(hwx() ? s_d.wx_feels : 95));
-        lv_obj_t* row = crow(scr, 300, 12);
-        lv_obj_t* lbl = rtext(row, "FEELS", PC_DIM, &font_styrene_24);
-        lv_obj_set_style_text_letter_space(lbl, 3, 0);
-        rtext(row, n, PC_TEXT, &font_departure_48);
-        degree_mark(row, PC_DIM, 14);
+        char f[8], hi[8], lo[8];
+        snprintf(f,  sizeof f,  "%d", (int)lroundf(hwx() ? s_d.wx_feels : 95));
+        snprintf(hi, sizeof hi, "%d", (int)lroundf(hwx() ? s_d.wx_hi : 87));
+        snprintf(lo, sizeof lo, "%d", (int)lroundf(hwx() ? s_d.wx_lo : 72));
+        wx_cell(scr, W / 6,     272, "FEELS", f,  PC_TEXT, true);
+        wx_cell(scr, W / 2,     272, "HIGH",  hi, PC_TEXT, true);
+        wx_cell(scr, 5 * W / 6, 272, "LOW",   lo, PC_TEXT, true);
     }
 
-    // Next 12 hours: temperature as columns (each on the cold→hot ramp) with the
-    // rain chance as a lane beneath, so "when does it cool off / when does it
-    // rain" is one glance and no axis.
+    wx_rule(scr, 344, W);
+
+    // The next twelve hours, every other hour, as type rather than columns —
+    // each temperature carries its own colour off the cold->hot ramp, which is
+    // all the "chart" a six-value series needs.
     {
         static const float MOCK_T[12] = {86,86,87,85,84,81,78,76,74,73,71,70};
-        static const float MOCK_P[12] = {3,5,5,2,0,0,0,0,0,0,0,0};
         const bool live = hwx() && s_d.wx_nhours > 0;
-        const int n = live ? s_d.wx_nhours : 12;
+        const int have = live ? s_d.wx_nhours : 12;
         const float* temps = live ? s_d.wx_hourly : MOCK_T;
-        const float* rain  = live ? s_d.wx_precip : MOCK_P;
-        // Scale the columns across the day's own range, not from absolute zero:
-        // a 70→87 spread is invisible on a 0→87 axis.
-        float lo = temps[0], hi = temps[0];
-        for (int i = 0; i < n; i++) { if (temps[i] < lo) lo = temps[i]; if (temps[i] > hi) hi = temps[i]; }
-        const float span = (hi - lo) < 1.0f ? 1.0f : (hi - lo);
-
-        const int cw = W - 64, ch = 56;
-        uint16_t* b = mkbuf(cw, ch);
-        PaintJob* j = add_job();
-        if (j && b) {
-            j->kind = PK_COLUMNS;
-            j->buf = b; j->w = cw; j->h = ch; j->cell = 2;
-            j->n = n > 12 ? 12 : n;
-            j->max_v = 1.0f;
-            for (int i = 0; i < j->n; i++) {
-                j->vals[i] = 0.28f + 0.72f * (temps[i] - lo) / span;  // floor so a
-                j->colors[i] = temp_color(temps[i]);                  // cool hour
-            }                                                          // still reads
-            j->canvas = canvas_at(scr, b, cw, ch, 32, 352);
-            paint_job(j, 0);
-        }
-        uint16_t* lb = mkbuf(cw, 16);
-        PaintJob* lj = add_job();
-        if (lj && lb) {
-            lj->kind = PK_LANE;
-            lj->buf = lb; lj->w = cw; lj->h = 16; lj->cell = 2;
-            lj->n = n > 12 ? 12 : n;
-            lj->max_v = 100.0f;
-            for (int i = 0; i < lj->n; i++) lj->vals[i] = rain[i];
-            lj->color = PC_RAIN;
-            lj->min_density = 0.06f;   // 3% rain must read as almost nothing
-            lj->canvas = canvas_at(scr, lb, cw, 16, 32, 414);
-            paint_job(lj, 0);
+        const int h0 = live ? s_d.wx_hour0 : 15;
+        for (int k = 0; k < 6; k++) {
+            const int i = k * 2;
+            if (i >= have) break;
+            char lbl[6], val[8];
+            hour_label(lbl, sizeof lbl, h0 + i);
+            snprintf(val, sizeof val, "%d", (int)lroundf(temps[i]));
+            wx_cell(scr, W * (2 * k + 1) / 12, 368, lbl, val, temp_color(temps[i]), false);
         }
     }
 }
 
-// MARKET — no ring here: a market is a shape over time, and the Dither Kit's
-// sparkline (the form the AI views only ever use two centimetres tall) finally
-// gets to be the hero. The three indexes sit above it as equals rather than one
-// hero index, and the movers are Luke's own book, ranked by percent.
+// MARKET — a stacked list, in the shape of the TradingView widget Luke reads on
+// his phone: one row per instrument, symbol left, last price and today's move
+// right. The first cut had a hero sparkline and a direction triangle; both are
+// gone at his call. Six rows in two groups — the three indexes, then the three
+// biggest movers in his own book (ranked by percent, from the top 25 positions
+// by value).
 //
-// The absolute index LEVEL is deliberately absent: on a 38mm panel "7,757.64"
-// costs the width of the whole screen to say something you don't act on. What
-// you act on is the move.
-static void view_market(lv_obj_t* scr) {
-    chrome(scr, nullptr);
-    const int W = board_caps().width;
-    const float lead = (hmk() && s_d.mk_nix > 0) ? s_d.mk_ix_pct[0] : 0.62f;
+// Column geometry is set by Departure Mono's ~21px glyph at dep_32: the price
+// is right-aligned at PRICE_R and the move at MOVE_R, leaving the symbol the
+// span from the left margin to PRICE_R minus the widest price. Index prices
+// drop their cents (a 7,757.64 that moves 48 points a day does not need them);
+// smaller share prices keep them.
+enum { MK_LEFT = 26, MK_PRICE_R = 300, MK_MOVE_R = 454 };
 
-    // Header mark: direction of the lead index, drawn as a solid triangle.
-    {
-        const int D = 84;
-        uint16_t* b = mkbuf(D, D);
-        if (b) {
-            draw_triangle(b, D, lead >= 0, lead >= 0 ? PC_UP : PC_DOWN);
-            canvas_at(scr, b, D, D, 20, 12);
-        }
+// "26690.62" -> "26,691" / "133.11" -> "133.11". Grouping is hand-rolled:
+// newlib on the ESP32 has no locale to lean on for %'d.
+static void fmt_price(char* out, size_t n, float v) {
+    if (v < 1000.0f) { snprintf(out, n, "%.2f", v); return; }
+    char raw[16];
+    snprintf(raw, sizeof raw, "%ld", (long)(v + 0.5f));
+    const int len = (int)strlen(raw);
+    int w = 0;
+    for (int i = 0; i < len && w < (int)n - 1; i++) {
+        if (i > 0 && (len - i) % 3 == 0) out[w++] = ',';
+        if (w < (int)n - 1) out[w++] = raw[i];
     }
+    out[w] = '\0';
+}
+
+// One list row: symbol, right-aligned price, right-aligned move (+ its unit).
+static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct) {
+    lv_obj_t* s = rtext(scr, sym, PC_TEXT, &font_styrene_24);
+    lv_obj_set_style_text_letter_space(s, 3, 0);
+    lv_obj_update_layout(s);
+    lv_obj_set_pos(s, MK_LEFT, y + 6);          // optical centre against dep_32
+
+    char p[16];
+    fmt_price(p, sizeof p, price);
+    lv_obj_t* pl = rtext(scr, p, PC_DIM, &font_departure_32);
+    lv_obj_update_layout(pl);
+    lv_obj_set_pos(pl, MK_PRICE_R - lv_obj_get_width(pl), y);
+
+    char v[12];
+    snprintf(v, sizeof v, "%+.2f", pct);
+    lv_obj_t* row = lv_obj_create(scr);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+    lv_obj_set_style_pad_column(row, 2, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_32);
+    rtext(row, "%", PC_DIM, &font_styrene_20);
+    lv_obj_update_layout(row);
+    lv_obj_set_pos(row, MK_MOVE_R - lv_obj_get_width(row), y);
+}
+
+static void view_market(lv_obj_t* scr) {
+    chrome(scr, "MARKET");
+    const int W = board_caps().width;
 #ifndef UI_SHOT
     if (!hmk()) { no_data(scr); return; }
 #endif
-    // Session state, top-right — dead space on every other view.
+    // Session state, top-right. Phrased as the NEXT event, not the current one:
+    // "CLOSED 18H" read as "closed for 18 hours" when it meant "opens in 18"
+    // (Luke, on a Sunday afternoon 48 hours into a weekend). "OPENS IN 18H"
+    // can only be read one way, and it still says the market is shut.
     if (hmk() && s_d.mk_status[0]) {
-        char s[24];
+        const bool open = strcmp(s_d.mk_status, "OPEN") == 0;
         char d[8];
         fmt_dur(d, sizeof d, s_d.mk_countdown_mins);
-        snprintf(s, sizeof s, "%s  %s", s_d.mk_status,
-                 strcmp(s_d.mk_status, "OPEN") == 0 ? d : d);
-        lv_obj_t* t = lv_label_create(scr);
-        lv_label_set_text(t, s);
-        lv_obj_set_style_text_font(t, &font_styrene_24, 0);
-        lv_obj_set_style_text_color(t, PC_DIM, 0);
+        char msg[24];
+        snprintf(msg, sizeof msg, "%s IN %s", open ? "CLOSES" : "OPENS", d);
+        lv_obj_t* t = rtext(scr, msg, PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
         lv_obj_update_layout(t);
-        lv_obj_set_pos(t, W - 28 - lv_obj_get_width(t), 26);
+        lv_obj_set_pos(t, W - 26 - lv_obj_get_width(t), 18);
     }
 
-    // Three indexes as equals: name, then today's move at hero size.
     {
-        static const char* MOCK_N[3] = {"S&P", "NDX", "RUT"};
+        static const char* MOCK_N[3] = {"S&P 500", "NASDAQ", "RUSSELL"};
+        static const float MOCK_P[3] = {7757.64f, 26690.62f, 3034.49f};
         static const float MOCK_C[3] = {0.62f, 1.30f, 1.10f};
         const bool live = hmk() && s_d.mk_nix > 0;
         const int n = live ? s_d.mk_nix : 3;
-        // Thirds of the screen, not (i+1)/(n+1): at 120/240/360 the three
-        // numbers run into each other. Departure Mono is ~32px per glyph at
-        // dep_48, so "+0.6" is 128px and only just clears its neighbours —
-        // which is why the unit is a SEPARATE styrene_24 glyph hanging off the
-        // right (14px) instead of a fifth mono glyph (another 32px, overflow).
-        for (int i = 0; i < n && i < 3; i++) {
-            const int cx = W * (2 * i + 1) / 6;
-            const float pct = live ? s_d.mk_ix_pct[i] : MOCK_C[i];
-            brow_col(scr, live ? s_d.mk_ix_name[i] : MOCK_N[i], cx, 118);
-            char v[12];
-            snprintf(v, sizeof v, "%+.1f", pct);
-            lv_obj_t* row = lv_obj_create(scr);
-            lv_obj_remove_style_all(row);
-            lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-            lv_obj_set_style_pad_column(row, 3, 0);
-            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_48);
-            rtext(row, "%", PC_DIM, &font_styrene_24);
-            lv_obj_update_layout(row);
-            // Centre the GROUP, not the numeral: centring the digits would push
-            // the rightmost "%" past the screen edge.
-            lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, 150);
-        }
+        for (int i = 0; i < n && i < 3; i++)
+            mk_row(scr, 92 + i * 52,
+                   live ? s_d.mk_ix_name[i] : MOCK_N[i],
+                   live ? s_d.mk_ix_price[i] : MOCK_P[i],
+                   live ? s_d.mk_ix_pct[i]   : MOCK_C[i]);
     }
 
-    // Lead index intraday. The prior close rides the SAME scale (the daemon
-    // normalises them together), so "above the line" means "up on the day" —
-    // draw it as a hairline over the series.
+    // Hairline + eyebrow: the movers are a different KIND of row (his book, not
+    // the market), and the rule is what says so without a word of explanation.
     {
-        static const float MOCK_S[16] = {0.35f,0.42f,0.38f,0.55f,0.61f,0.58f,0.72f,0.68f,
-                                         0.75f,0.83f,0.79f,0.88f,0.84f,0.91f,0.95f,0.93f};
-        const bool live = hmk() && s_d.mk_nspark > 1;
-        const int n = live ? s_d.mk_nspark : 16;
-        const int sx = 32, sy = 216, sw = W - 64, sh = 96;
-        job_spark(scr, sx, sy, sw, sh, live ? s_d.mk_spark : MOCK_S, n,
-                  lead >= 0 ? PC_UP : PC_DOWN);
-        const float base = live ? s_d.mk_baseline : 0.30f;
-        lv_obj_t* line = lv_obj_create(scr);
-        lv_obj_remove_style_all(line);
-        lv_obj_set_size(line, sw, 2);
-        lv_obj_set_style_bg_color(line, PC_GREY, 0);   // PC_HAIR vanishes over the dither
-        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-        int by = sy + (int)((1.0f - (base < 0 ? 0 : base > 1 ? 1 : base)) * (sh - 2));
-        lv_obj_set_pos(line, sx, by);
+        lv_obj_t* hr = lv_obj_create(scr);
+        lv_obj_remove_style_all(hr);
+        lv_obj_set_size(hr, W - 2 * MK_LEFT, 1);
+        lv_obj_set_style_bg_color(hr, PC_HAIR, 0);
+        lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(hr, MK_LEFT, 250);
+        lv_obj_t* e = rtext(scr, "TOP MOVERS", PC_DIM, &font_styrene_24);
+        lv_obj_set_style_text_letter_space(e, 3, 0);
+        lv_obj_set_pos(e, MK_LEFT, 266);
     }
 
-    // Luke's movers. Symbol over percent, three columns — same grammar as the
-    // index row above so the eye reads them as "and inside that, these".
     {
         static const char* MOCK_S[3] = {"SPCX", "NLR", "TOL"};
-        static const float MOCK_P[3] = {15.83f, 3.47f, -2.48f};
+        static const float MOCK_P[3] = {133.11f, 92.40f, 118.75f};
+        static const float MOCK_C[3] = {15.83f, 3.47f, -2.48f};
         const bool live = hmk() && s_d.mk_nmv > 0;
         const int n = live ? s_d.mk_nmv : 3;
-        eyebrow_c(scr, "TOP MOVERS", PC_DIM, &font_styrene_24, 344);
-        for (int i = 0; i < n && i < 3; i++) {
-            const int cx = W * (2 * i + 1) / 6;
-            const float pct = live ? s_d.mk_mv_pct[i] : MOCK_P[i];
-            brow_col(scr, live ? s_d.mk_mv_sym[i] : MOCK_S[i], cx, 384);
-            char v[12];
-            snprintf(v, sizeof v, "%+.1f", pct);
-            lv_obj_t* row = lv_obj_create(scr);
-            lv_obj_remove_style_all(row);
-            lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-            lv_obj_set_style_pad_column(row, 2, 0);
-            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_32);
-            rtext(row, "%", PC_DIM, &font_styrene_20);
-            lv_obj_update_layout(row);
-            lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, 412);
-        }
+        for (int i = 0; i < n && i < 3; i++)
+            mk_row(scr, 312 + i * 44,
+                   live ? s_d.mk_mv_sym[i]   : MOCK_S[i],
+                   live ? s_d.mk_mv_price[i] : MOCK_P[i],
+                   live ? s_d.mk_mv_pct[i]   : MOCK_C[i]);
     }
 }
 

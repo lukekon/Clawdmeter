@@ -49,30 +49,6 @@ def test_hhmm_is_12_hour():
 
 # ── market ───────────────────────────────────────────────────────────────────
 
-def test_norm_series_shares_a_scale_with_the_prior_close():
-    """The baseline must ride the SAME scale as the series, or 'above the line'
-    stops meaning 'up on the day'."""
-    pts, base = d._norm_series([100.0, 110.0, 120.0], 100.0)
-    assert base == 0.0                       # prior close is the low here
-    assert pts[0] == 0.0 and pts[-1] == 1.0
-
-
-def test_norm_series_includes_a_baseline_above_the_whole_session():
-    """A down day: every point must land BELOW the baseline."""
-    pts, base = d._norm_series([90.0, 95.0, 92.0], 100.0)
-    assert base == 1.0
-    assert max(pts) < 1.0
-
-
-def test_norm_series_survives_a_flat_session():
-    pts, base = d._norm_series([50.0, 50.0], 50.0)
-    assert base == 0.5 and pts == [0.5, 0.5]
-
-
-def test_norm_series_handles_an_empty_series():
-    assert d._norm_series([], 100.0) == ([], 0.5)
-
-
 def test_market_status_open_counts_down_to_the_close():
     now = 1000.0
     period = {"regular": {"start": 940.0, "end": 1000.0 + 3600}}

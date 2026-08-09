@@ -198,6 +198,7 @@ static bool parse_json(const char* json, UsageData* out) {
     strlcpy(out->wx_sunrise, wx["sr"] | "", sizeof(out->wx_sunrise));
     strlcpy(out->wx_sunset,  wx["ss"] | "", sizeof(out->wx_sunset));
     out->wx_daylight_pct = wx["dp"] | 0;
+    out->wx_hour0 = wx["h0"] | 0;
     out->wx_nhours = 0;
     for (JsonVariantConst h : wx["hr"].as<JsonArrayConst>()) {
         if (out->wx_nhours >= 12) break;
@@ -214,22 +215,17 @@ static bool parse_json(const char* json, UsageData* out) {
     out->mk_nix = 0;
     for (JsonVariantConst ix : mk["ix"].as<JsonArrayConst>()) {
         if (out->mk_nix >= 3) break;
-        strlcpy(out->mk_ix_name[out->mk_nix], ix["s"] | "", 8);
+        strlcpy(out->mk_ix_name[out->mk_nix], ix["s"] | "", 12);
         out->mk_ix_price[out->mk_nix] = ix["p"] | 0.0f;
         out->mk_ix_pct[out->mk_nix]   = ix["c"] | 0.0f;
         out->mk_nix++;
     }
-    out->mk_nspark = 0;
-    for (JsonVariantConst v2 : mk["sp"].as<JsonArrayConst>()) {
-        if (out->mk_nspark >= 32) break;
-        out->mk_spark[out->mk_nspark++] = v2 | 0.0f;
-    }
-    out->mk_baseline = mk["b"] | 0.0f;
     out->mk_nmv = 0;
     for (JsonVariantConst m : mk["mv"].as<JsonArrayConst>()) {
         if (out->mk_nmv >= 3) break;
-        strlcpy(out->mk_mv_sym[out->mk_nmv], m["s"] | "", 8);
+        strlcpy(out->mk_mv_sym[out->mk_nmv], m["s"] | "", 12);
         out->mk_mv_pct[out->mk_nmv] = m["c"] | 0.0f;
+        out->mk_mv_price[out->mk_nmv] = m["p"] | 0.0f;
         out->mk_nmv++;
     }
     strlcpy(out->mk_status, mk["st"] | "", sizeof(out->mk_status));

@@ -1195,6 +1195,9 @@ async def fetch_weather() -> dict:
             "lo": round(daily["temperature_2m_min"][0]),
             "sr": _hhmm(sunrise), "ss": _hhmm(sunset),
             "dp": _daylight_pct(now, sunrise, sunset),
+            # The clock hour the hourly list starts at, so the device can label
+            # the columns without us shipping twelve strings.
+            "h0": int(cur["time"][11:13]),
             "hr": [round(v) for v in hourly["temperature_2m"][window]],
             "pp": [round(v or 0) for v in hourly["precipitation_probability"][window]],
         }
@@ -1219,13 +1222,12 @@ async def fetch_weather() -> dict:
 # an endpoint nobody promised us.
 MARKET_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
 MARKET_HEADERS = {"User-Agent": "Mozilla/5.0"}
-MARKET_INDEXES = [("^GSPC", "S&P"), ("^IXIC", "NDX"), ("^RUT", "RUT")]
+MARKET_INDEXES = [("^GSPC", "S&P 500"), ("^IXIC", "NASDAQ"), ("^RUT", "RUSSELL")]
 MARKET_TOP_N = 25
 # Measured, not documented: the endpoint 400s at 21+ symbols in one call
 # (20 is fine, 21 is not, and it is a cap rather than a bad ticker — the
 # rejected tail returns 200 on its own). So the roster is sent in chunks.
 MARKET_CHUNK = 20
-MARKET_SPARK_POINTS = 32
 MARKET_RECOMPUTE_S = 60
 _HOLDINGS_SIDECAR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
                      / "Clawdmeter" / "holdings.json")
@@ -1262,27 +1264,6 @@ def _market_status(period: dict, now: float) -> tuple[str, int]:
             break
         nxt += 86400
     return "CLOSED", int(max(0, nxt - now) // 60)
-
-
-def _norm_series(series: list[float], baseline: float) -> tuple[list[float], float]:
-    """Scale an intraday series to 0..1 over its own min/max INCLUDING the prior
-    close, and return where that prior close sits in the same scale.
-
-    Normalising by max alone (what norm7 does for the $ sparks) would squash a
-    7700->7760 index day into a flat line at 0.99. The baseline has to share the
-    scale or the "above/below yesterday" read is a lie.
-    """
-    pts = [v for v in series if v is not None]
-    if not pts:
-        return [], 0.5
-    lo, hi = min(pts + [baseline]), max(pts + [baseline])
-    span = hi - lo
-    if span <= 0:
-        return [0.5] * len(pts), 0.5
-    step = max(1, len(pts) / MARKET_SPARK_POINTS)
-    out = [round((pts[min(int(k * step), len(pts) - 1)] - lo) / span, 3)
-           for k in range(min(MARKET_SPARK_POINTS, len(pts)))]
-    return out, round((baseline - lo) / span, 3)
 
 
 async def fetch_market() -> dict:
@@ -1342,14 +1323,16 @@ async def fetch_market() -> dict:
                 for sym, label in MARKET_INDEXES if sym in by_symbol]
     hero = by_symbol.get(MARKET_INDEXES[0][0])
     if hero:
-        mk["sp"], mk["b"] = _norm_series(hero["closes"], hero["prev"])
+        # The intraday series is no longer drawn (the view is a stacked list, not
+        # a chart), so it is not sent — it was ~200B of every payload.
         status, mins = _market_status(hero["period"], now)
         if status:
             mk["st"], mk["cd"] = status, mins
     # Top 3 movers by PERCENT (Luke's call) over the priced holdings only.
     movers = sorted((s for s in holdings if s in by_symbol),
                     key=lambda s: -abs(by_symbol[s]["pct"]))[:3]
-    mk["mv"] = [{"s": s, "c": round(by_symbol[s]["pct"], 2)} for s in movers]
+    mk["mv"] = [{"s": s, "c": round(by_symbol[s]["pct"], 2),
+                 "p": round(by_symbol[s]["price"], 2)} for s in movers]
     _market_cache.update(ts=now, data={"mk": mk})
     return {"mk": mk}
 
