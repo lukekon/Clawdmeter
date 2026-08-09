@@ -1475,7 +1475,23 @@ static void view_weather(lv_obj_t* scr) {
 // span from the left margin to PRICE_R minus the widest price. Index prices
 // drop their cents (a 7,757.64 that moves 48 points a day does not need them);
 // smaller share prices keep them.
-enum { MK_LEFT = 26, MK_PRICE_R = 300, MK_MOVE_R = 454 };
+//
+// Vertical rhythm is ONE pitch for all six rows — the first cut used 52 for the
+// indexes and 44 for the movers, and the mismatch was visible. Derived rather
+// than hand-placed so the two groups can't drift apart again: rows are 32px
+// tall, so the block runs from MK_TOP to MK_MOVE_Y + 2*MK_PITCH + 32 = 412,
+// leaving ~34px clear of the header above and ~36px of the page dots below.
+enum {
+    MK_LEFT    = 26,
+    MK_PRICE_R = 300,
+    MK_MOVE_R  = 454,
+    MK_TOP     = 76,                              // first index row
+    MK_PITCH   = 48,                              // every row, both groups
+    MK_ROW_H   = 32,                              // dep_32 band
+    MK_RULE_Y  = MK_TOP + 2 * MK_PITCH + MK_ROW_H + 22,   // 226
+    MK_BROW_Y  = MK_RULE_Y + 14,                          // 240
+    MK_MOVE_Y  = MK_BROW_Y + 24 + 20,                     // 284 — first mover row
+};
 
 // "26690.62" -> "26,691" / "133.11" -> "133.11". Grouping is hand-rolled:
 // newlib on the ESP32 has no locale to lean on for %'d.
@@ -1549,7 +1565,7 @@ static void view_market(lv_obj_t* scr) {
         const bool live = hmk() && s_d.mk_nix > 0;
         const int n = live ? s_d.mk_nix : 3;
         for (int i = 0; i < n && i < 3; i++)
-            mk_row(scr, 92 + i * 52,
+            mk_row(scr, MK_TOP + i * MK_PITCH,
                    live ? s_d.mk_ix_name[i] : MOCK_N[i],
                    live ? s_d.mk_ix_price[i] : MOCK_P[i],
                    live ? s_d.mk_ix_pct[i]   : MOCK_C[i]);
@@ -1564,10 +1580,10 @@ static void view_market(lv_obj_t* scr) {
         lv_obj_set_style_bg_color(hr, PC_HAIR, 0);
         lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
         lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(hr, MK_LEFT, 250);
+        lv_obj_set_pos(hr, MK_LEFT, MK_RULE_Y);
         lv_obj_t* e = rtext(scr, "TOP MOVERS", PC_DIM, &font_styrene_24);
         lv_obj_set_style_text_letter_space(e, 3, 0);
-        lv_obj_set_pos(e, MK_LEFT, 266);
+        lv_obj_set_pos(e, MK_LEFT, MK_BROW_Y);
     }
 
     {
@@ -1577,7 +1593,7 @@ static void view_market(lv_obj_t* scr) {
         const bool live = hmk() && s_d.mk_nmv > 0;
         const int n = live ? s_d.mk_nmv : 3;
         for (int i = 0; i < n && i < 3; i++)
-            mk_row(scr, 312 + i * 44,
+            mk_row(scr, MK_MOVE_Y + i * MK_PITCH,
                    live ? s_d.mk_mv_sym[i]   : MOCK_S[i],
                    live ? s_d.mk_mv_price[i] : MOCK_P[i],
                    live ? s_d.mk_mv_pct[i]   : MOCK_C[i]);
