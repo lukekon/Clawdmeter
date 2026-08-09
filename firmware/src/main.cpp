@@ -113,6 +113,11 @@ static bool parse_json(const char* json, UsageData* out) {
     out->session_reset_mins = doc["sr"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
+    // "s" gates the Claude view: present means the daemon has numbers, whether
+    // from a fresh poll or its last-good reading aged off the wall clock. "ol"
+    // says which — absent/0 = projected (the OAuth token was dead).
+    out->claude_limits_valid = !doc["s"].isNull();
+    out->claude_limits_live = (doc["ol"] | 0) != 0;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
     const char* acct = doc["acct"] | "pro";
@@ -439,6 +444,7 @@ void setup() {
         f.codex_week_usd = 65;   f.codex_today_usd = 65;
         strlcpy(f.codex_model, "5.6 SOL", sizeof(f.codex_model));
         f.ok = true; f.valid = true;
+        f.claude_limits_valid = true; f.claude_limits_live = true;
         // Seed the session sparkline with a fake wobbly climb so QA screenshots
         // show a trend line, not a single point.
         for (int i = 0; i < 40; i++) {

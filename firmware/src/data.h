@@ -40,6 +40,12 @@ struct UsageData {
     int session_reset_mins;  // minutes until reset
     float weekly_pct;        // 7-day utilization (Pro/Max only; 0 for Enterprise)
     int weekly_reset_mins;   // minutes until weekly reset (Pro/Max only)
+    // The 5h/7d numbers above need a live OAuth token, which only Claude Code
+    // refreshes while it runs — so an idle desk used to blank the Claude view.
+    // The daemon now keeps a last-good reading and ages it off the wall clock
+    // (as it already does for Kimi), so "s" is present either way:
+    bool claude_limits_valid;  // "s" present → the view has numbers to draw
+    bool claude_limits_live;   // "ol"=1 → those numbers came off a fresh poll
     char status[16];         // "allowed", "limited", etc.
     bool chime;              // play the session-reset chime; false unless daemon opts in
     bool enterprise;         // true = Enterprise spending-limit account

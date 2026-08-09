@@ -1217,6 +1217,7 @@ async def poll_api(token: str) -> dict | None:
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
             "ok": True,
+            "ol": 1,   # limits are LIVE (vs claude_limits_projection's "ol":0)
         }
     else:
         reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
@@ -1229,6 +1230,7 @@ async def poll_api(token: str) -> dict | None:
             "acct": "ent",
             **_billing_period_info(now, reset_ts),
             "ok": True,
+            "ol": 1,
         }
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
@@ -1437,18 +1439,105 @@ def _read_expiry() -> str:
     return "expiry unknown"
 
 
+# ── Claude's 5h/7d limits: last-good + wall-clock projection ─────────────────
+# Claude is the only provider whose limits come off the wire; the other three
+# read local logs. The OAuth token that poll_api needs is refreshed only while
+# Claude Code is RUNNING, so an idle desk means a run of 401s — and the Claude
+# view was the one view that went blank precisely when you stopped using it,
+# while Grok/Kimi/Codex all kept showing their last numbers.
+#
+# Same treatment Kimi already gets: keep the last live reading with its reset
+# times as ABSOLUTE epochs, persist it so a daemon restart doesn't blank the
+# view, and age it forward with _project_window() — the % holds and the
+# countdown ticks until the window's reset passes, at which point it rolled
+# over (you're idle, so usage is ~0) and the % zeroes. A live poll overwrites
+# all of it. The payload flags which you're looking at with "ol".
+_claude_limits_cache = {"s_pct": 0, "s_reset_epoch": None, "s_window_min": 300,
+                 "w_pct": 0, "w_reset_epoch": None, "w_window_min": 10080,
+                 "st": "allowed", "seen": False}
+_CLAUDE_SIDECAR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+                   / "Clawdmeter" / "claude_limits.json")
+_CLAUDE_SIDECAR_KEYS = ("s_pct", "s_reset_epoch", "s_window_min",
+                        "w_pct", "w_reset_epoch", "w_window_min", "st", "seen")
+
+
+def _save_claude_sidecar() -> None:
+    """Persist last-good limits so a daemon restart doesn't blank the Claude view."""
+    try:
+        _CLAUDE_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        _CLAUDE_SIDECAR.write_text(
+            json.dumps({k: _claude_limits_cache[k] for k in _CLAUDE_SIDECAR_KEYS}), encoding="utf-8")
+    except OSError:
+        pass  # best-effort — persistence must never disturb the poll loop
+
+
+def _load_claude_sidecar() -> None:
+    """Seed the cache from the sidecar on startup (best-effort)."""
+    try:
+        saved = json.loads(_CLAUDE_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for k in _CLAUDE_SIDECAR_KEYS:
+        if k in saved and saved[k] is not None:
+            _claude_limits_cache[k] = saved[k]
+
+
+def remember_claude_limits(payload: dict) -> None:
+    """Record a live 5h/7d reading as last-good, resets stored as absolute epochs.
+
+    Pro/Max only: the Enterprise branch of poll_api reports a spending limit with
+    a different shape ("w" is always 0), and projecting a monthly billing figure
+    as if it were a rolling window would invent numbers.
+    """
+    if payload.get("acct") != "pro":
+        return
+    now = time.time()
+    s_reset, w_reset = payload.get("sr"), payload.get("wr")
+    _claude_limits_cache.update(
+        s_pct=int(payload.get("s", 0)),
+        w_pct=int(payload.get("w", 0)),
+        st=payload.get("st", "allowed"),
+        seen=True,
+    )
+    # A reset of 0/None means "unknown" from the header scrape — keep the epoch
+    # we already have rather than pinning the countdown to now.
+    if s_reset:
+        _claude_limits_cache["s_reset_epoch"] = now + s_reset * 60
+    if w_reset:
+        _claude_limits_cache["w_reset_epoch"] = now + w_reset * 60
+    _save_claude_sidecar()
+
+
+def claude_limits_projection() -> dict:
+    """Last-good 5h/7d limits aged off the wall clock; {} if none was ever seen."""
+    if not _claude_limits_cache["seen"]:
+        return {}
+    now = time.time()
+    c = _claude_limits_cache
+    s_pct, s_reset = _project_window(c["s_pct"], c["s_reset_epoch"], c["s_window_min"], now)
+    w_pct, w_reset = _project_window(c["w_pct"], c["w_reset_epoch"], c["w_window_min"], now)
+    return {"s": s_pct, "sr": s_reset, "w": w_pct, "wr": w_reset,
+            "st": c["st"], "acct": "pro", "ol": 0}
+
+
 async def _send_local_only(ser: "serial.Serial") -> None:
     """Stream just the locally-computed fields (Grok/Kimi/Codex + vitals).
 
-    The payload's Claude fields ride on the OAuth poll, so the old all-or-
+    The payload's Claude limits ride on the OAuth poll, so the old all-or-
     nothing path sent NOTHING while the Claude token was dead — and the desk
     gauge sat on its boot placeholders, which look like live numbers. The
-    other providers read LOCAL logs (no token), so keep them flowing; the
-    firmware reads the absent "ok" as Claude-view no-data. Best-effort: a
-    build failure sends nothing, same as before.
+    other providers read LOCAL logs (no token), so keep them flowing.
+
+    Claude keeps flowing too, from two token-free sources: its 5h/7d limits are
+    projected from the last live reading (claude_limits_projection, tagged
+    "ol":0), and its $ / models-in-use / 7-day series come from the local
+    transcripts, which never needed the token at all. Best-effort: a build
+    failure sends nothing, same as before.
     """
     try:
         payload: dict = {}
+        payload.update(claude_limits_projection())
+        payload.update(fetch_claude_extras())
         payload.update(await fetch_grok_usage())
         payload.update(await fetch_kimi_usage())
         payload.update(await fetch_codex_usage())
@@ -1488,6 +1577,7 @@ async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
         # already logged it; do NOT toast "token expired" (that mislabeled a
         # boot-time DNS blip as an auth problem, SC#5). Next poll retries.
         return
+    remember_claude_limits(payload)   # last-good, for the next dead-token stretch
     # Phase-B real data — the model-scoped weekly limit (Fable/Opus), Claude
     # transcript activity, and machine vitals. All best-effort and merged here
     # (not in poll_api) so the proven 5h/7d + Grok path is untouched; any failure
@@ -1585,6 +1675,10 @@ async def main(tray_state=None) -> None:
     stop_event = asyncio.Event()
     view_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+
+    # Restore Claude's last-good limits before the first poll, so a restart while
+    # the token is dead still streams numbers instead of blanking the view.
+    _load_claude_sidecar()
 
     # Global mouse side-button -> view control (Windows only; harmless if it fails).
     threading.Thread(target=_run_mouse_hook, args=(loop, view_event),

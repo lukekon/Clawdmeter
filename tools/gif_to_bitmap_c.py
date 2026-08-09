@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """Bakes the animated OpenAI logo gif into firmware/src/logo_codex_anim.h as a
-hi-res bitmap animation: 80x80 px, 4-bit grayscale (16 levels), two pixels per
+hi-res bitmap animation: PX x PX, 4-bit grayscale (16 levels), two pixels per
 byte. Played by header_codex_logo() in firmware/src/proto.cpp.
 
 Why this exists: the splash-mini engine renders on a fixed 20x20 cell grid,
-which made the knot look blocky on the Codex view. This path keeps full 80x80
+which made the knot look blocky on the Codex view. This path keeps full
 detail with real anti-aliasing. The knot is NOT in the splash engine's
-claudepix_data set — this is its only firmware representation.
+claudepix_data set - this is its only firmware representation.
 
 Source gif: assets/openai_logo_animation.gif (white knot on black, 671x671;
-scanlines -> arcs -> knot -> slow spin -> loop). Uses the same fixed-crop rule
-as the 20x20 converter did: one shared square crop (union bbox + margin) for
-all frames so the knot stays centred and constant-size.
+scanlines -> arcs -> knot -> hold -> loop).
 
-The spin phase (from SPIN_START on) is nearly static per frame, so it is
-thinned 2:1 — halves flash use, visibly identical at the 80ms device tick.
+Two rules earn their keep here:
 
-Usage: .venv/Scripts/python.exe tools/gif_to_bitmap_c.py
-Writes: firmware/src/logo_codex_anim.h
+1. The crop is sized off the SETTLED KNOT, not the union of every frame.
+   The build-up phase sweeps arcs wider than the finished knot, so a union
+   crop left the steady-state mark filling only ~64% of the canvas - it read
+   as a small logo next to the Grok mark, which fills its box. Cropping to
+   knot_bbox / KNOT_FRAC makes the resting knot the thing that fills the
+   frame; the widest build-up frames lose a few edge pixels (reported below).
+
+2. Consecutive identical frames collapse into one entry + a hold count.
+   The gif's "slow spin" tail is not a spin at all: frames 78..168 were
+   byte-identical, i.e. 91 duplicate frames costing ~290 KB of flash to hold
+   a still image. They are now one frame with a hold, so the device shows the
+   same pause for a fraction of the flash.
 """
 
 from pathlib import Path
@@ -28,68 +35,83 @@ ROOT = Path(__file__).resolve().parent.parent
 GIF = ROOT / "assets" / "openai_logo_animation.gif"
 OUT = ROOT / "firmware" / "src" / "logo_codex_anim.h"
 
-PX = 80                 # canvas is 80x80 on-device
+PX = 100                # canvas is PX x PX on-device
 T_BG = 28               # luminance below this is background (bbox threshold)
-MARGIN = 1.04           # fixed-crop padding around the union bbox
-SPIN_START = 70         # knot fully formed from here on (thin 2:1 past this)
-SPIN_KEEP_EVERY = 2
+KNOT_FRAC = 0.92        # settled knot fills this fraction of the canvas
+SETTLED_FROM = 78       # frames from here on are the resting knot
+HOLD_CAP = 60           # ticks; the gif rests ~15s on the knot, which reads as frozen
 
 
-def occupancy(frame: Image.Image) -> int:
-    h = frame.histogram()
-    return sum(h[T_BG:])
+def bbox_of(frame: Image.Image):
+    return frame.point(lambda v: 255 if v >= T_BG else 0).getbbox()
+
+
+def union(boxes):
+    xs0, ys0, xs1, ys1 = zip(*[b for b in boxes if b])
+    return min(xs0), min(ys0), max(xs1), max(ys1)
 
 
 def main() -> None:
     im = Image.open(GIF)
     raws = [f.convert("L").copy() for f in ImageSequence.Iterator(im)]
-    print(f"{GIF.name}: {len(raws)} frames, {im.size[0]}x{im.size[1]}")
-
-    # Drop any near-empty lead-in (no-op for the current gif).
-    peak = max(occupancy(f) for f in raws)
-    start = next(i for i, f in enumerate(raws) if occupancy(f) >= peak * 0.05)
-    raws = raws[start:]
-
-    # One fixed square crop for the whole loop.
-    x0, y0, x1, y1 = 1 << 30, 1 << 30, -1, -1
-    for f in raws:
-        bb = f.point(lambda v: 255 if v >= T_BG else 0).getbbox()
-        if bb:
-            x0, y0 = min(x0, bb[0]), min(y0, bb[1])
-            x1, y1 = max(x1, bb[2]), max(y1, bb[3])
-    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    half = max(x1 - x0, y1 - y0) / 2 * MARGIN
     W, H = im.size
+    print(f"{GIF.name}: {len(raws)} frames, {W}x{H}")
+
+    boxes = [bbox_of(f) for f in raws]
+    # Drop any near-empty lead-in (no-op for the current gif).
+    start = next(i for i, b in enumerate(boxes) if b)
+    raws, boxes = raws[start:], boxes[start:]
+
+    # Crop off the settled knot so IT fills the canvas (rule 1 above).
+    kx0, ky0, kx1, ky1 = union(boxes[SETTLED_FROM:])
+    cx, cy = (kx0 + kx1) / 2, (ky0 + ky1) / 2
+    half = max(kx1 - kx0, ky1 - ky0) / 2 / KNOT_FRAC
     half = min(half, cx, cy, W - cx, H - cy)
     box = (int(cx - half), int(cy - half), int(cx + half), int(cy + half))
-    print(f"fixed crop {box} ({box[2] - box[0]}px square)")
+    print(f"settled knot {(kx0, ky0, kx1, ky1)} -> crop {box} ({box[2] - box[0]}px square)")
 
-    grids = []
-    for f in raws:
-        small = f.crop(box).resize((PX, PX), Image.LANCZOS)
-        grids.append(list(small.getdata()))
+    # How much of the wider build-up phase falls outside that crop.
+    ax0, ay0, ax1, ay1 = union(boxes)
+    over = max(box[0] - ax0, box[1] - ay0, ax1 - box[2], ay1 - box[3], 0)
+    print(f"build-up overshoot: {over}px of source ({over / (box[2] - box[0]) * PX:.1f}px on canvas)")
 
-    keep = list(range(0, SPIN_START)) + list(range(SPIN_START, len(grids), SPIN_KEEP_EVERY))
-    print(f"keeping {len(keep)} of {len(grids)} frames (spin thinned {SPIN_KEEP_EVERY}:1 from frame {SPIN_START})")
+    grids = [list(f.crop(box).resize((PX, PX), Image.LANCZOS).getdata()) for f in raws]
+
+    # Collapse runs of identical frames into one entry + a hold count (rule 2).
+    packed_frames, holds = [], []
+    for g in grids:
+        nib = [(v * 15 + 127) // 255 for v in g]
+        row = bytes((nib[i] << 4) | nib[i + 1] for i in range(0, PX * PX, 2))
+        if packed_frames and row == packed_frames[-1]:
+            holds[-1] = min(holds[-1] + 1, HOLD_CAP)
+        else:
+            packed_frames.append(row)
+            holds.append(1)
+    print(f"{len(grids)} frames -> {len(packed_frames)} unique "
+          f"(longest hold {max(holds)} ticks)")
 
     lines = [
         "#pragma once",
         "// Generated by tools/gif_to_bitmap_c.py from assets/openai_logo_animation.gif",
-        "// - do not edit. 80x80 px, 4-bit grayscale, two pixels per byte (hi nibble",
-        "// first). Played by header_codex_logo() in proto.cpp.",
+        "// - do not edit. PX x PX, 4-bit grayscale, two pixels per byte (hi nibble",
+        "// first). Each frame carries a hold count in ticks: runs of identical",
+        "// source frames are stored once (the gif's tail is a still hold, not a",
+        "// spin). Played by header_codex_logo() in proto.cpp, which paints the",
+        "// grey level as ALPHA on white so the mark composites over the view.",
         f"#define CODEX_ANIM_PX {PX}",
-        f"#define CODEX_ANIM_FRAMES {len(keep)}",
+        f"#define CODEX_ANIM_FRAMES {len(packed_frames)}",
         f"#define CODEX_ANIM_FRAME_BYTES {PX * PX // 2}",
+        "static const uint8_t codex_anim_holds[CODEX_ANIM_FRAMES] = {",
+        "    " + ",".join(str(h) for h in holds),
+        "};",
         "static const uint8_t codex_anim_frames[CODEX_ANIM_FRAMES][CODEX_ANIM_FRAME_BYTES] = {",
     ]
-    for ki in keep:
-        nibbles = [(v * 15 + 127) // 255 for v in grids[ki]]
-        packed = [str((nibbles[i] << 4) | nibbles[i + 1]) for i in range(0, PX * PX, 2)]
-        lines.append("    {" + ",".join(packed) + "},")
+    for row in packed_frames:
+        lines.append("    {" + ",".join(str(b) for b in row) + "},")
     lines.append("};")
     OUT.write_text("\n".join(lines) + "\n", encoding="ascii")
-    kb = OUT.stat().st_size // 1024
-    print(f"wrote {OUT} ({kb} KB)")
+    print(f"wrote {OUT} ({OUT.stat().st_size // 1024} KB, "
+          f"{len(packed_frames) * PX * PX // 2} bytes of flash)")
 
 
 if __name__ == "__main__":
