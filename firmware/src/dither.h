@@ -52,9 +52,13 @@ void dither_sparkline(uint16_t* buf, int w, int h,
                       lv_color_t color, int cell, float live_alpha);
 
 // DitherLane — one-row density strip; value drives how solid each bucket is.
+// min_density is the floor a NON-ZERO bucket gets. The 0.4 default means "there
+// is something here" for load-style series, where a busy-but-small value must
+// still register. Pass a low floor for series where small genuinely means small
+// — a 3% chance of rain drawn at 40% density is a lie, not a design choice.
 void dither_lane(uint16_t* buf, int w, int h,
                  const float* vals, int n, float max_v,
-                 lv_color_t color, int cell);
+                 lv_color_t color, int cell, float min_density = 0.4f);
 
 // DitherTreemap tile: value drives area; ghost = sparse unclaimed remainder.
 typedef struct {

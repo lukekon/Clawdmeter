@@ -184,6 +184,57 @@ static bool parse_json(const char* json, UsageData* out) {
     for (int i = 0; i < 4; i++) out->claude_by[i]   = doc["cx"]["by"][i] | 0.0f;
     for (int i = 0; i < 7; i++) out->claude_week[i]  = doc["cx"]["wk"][i] | 0.0f;
 
+    // Weather ("wx") — absent → the weather view shows no data.
+    JsonVariantConst wx = doc["wx"];
+    out->wx_valid = !wx.isNull();
+    out->wx_temp  = wx["t"] | 0.0f;
+    out->wx_feels = wx["f"] | 0.0f;
+    out->wx_hi    = wx["hi"] | 0.0f;
+    out->wx_lo    = wx["lo"] | 0.0f;
+    out->wx_code  = wx["c"] | 0;
+    out->wx_is_day = (wx["d"] | 1) != 0;
+    out->wx_humidity = wx["h"] | 0;
+    out->wx_wind = wx["w"] | 0;
+    strlcpy(out->wx_sunrise, wx["sr"] | "", sizeof(out->wx_sunrise));
+    strlcpy(out->wx_sunset,  wx["ss"] | "", sizeof(out->wx_sunset));
+    out->wx_daylight_pct = wx["dp"] | 0;
+    out->wx_nhours = 0;
+    for (JsonVariantConst h : wx["hr"].as<JsonArrayConst>()) {
+        if (out->wx_nhours >= 12) break;
+        out->wx_hourly[out->wx_nhours] = h | 0.0f;
+        out->wx_precip[out->wx_nhours] = wx["pp"][out->wx_nhours] | 0.0f;
+        out->wx_nhours++;
+    }
+
+    // Market ("mk") — absent → the market view shows no data. Never fall back to
+    // a previous print: a stale quote passed off as live is the one thing a
+    // money display must not do.
+    JsonVariantConst mk = doc["mk"];
+    out->mk_valid = !mk.isNull();
+    out->mk_nix = 0;
+    for (JsonVariantConst ix : mk["ix"].as<JsonArrayConst>()) {
+        if (out->mk_nix >= 3) break;
+        strlcpy(out->mk_ix_name[out->mk_nix], ix["s"] | "", 8);
+        out->mk_ix_price[out->mk_nix] = ix["p"] | 0.0f;
+        out->mk_ix_pct[out->mk_nix]   = ix["c"] | 0.0f;
+        out->mk_nix++;
+    }
+    out->mk_nspark = 0;
+    for (JsonVariantConst v2 : mk["sp"].as<JsonArrayConst>()) {
+        if (out->mk_nspark >= 32) break;
+        out->mk_spark[out->mk_nspark++] = v2 | 0.0f;
+    }
+    out->mk_baseline = mk["b"] | 0.0f;
+    out->mk_nmv = 0;
+    for (JsonVariantConst m : mk["mv"].as<JsonArrayConst>()) {
+        if (out->mk_nmv >= 3) break;
+        strlcpy(out->mk_mv_sym[out->mk_nmv], m["s"] | "", 8);
+        out->mk_mv_pct[out->mk_nmv] = m["c"] | 0.0f;
+        out->mk_nmv++;
+    }
+    strlcpy(out->mk_status, mk["st"] | "", sizeof(out->mk_status));
+    out->mk_countdown_mins = mk["cd"] | -1;
+
     // Machine vitals ("cpu"/"gpu"/"ram"). Each block optional; *_valid gates it.
     Vitals& v = out->vitals;
     JsonVariantConst cpu = doc["cpu"];
@@ -267,7 +318,9 @@ static bool process_usage_json(const char* json) {
 // Phase B adds vitals (per-core array + device names) + the three Claude limits +
 // Grok/Claude 7-day series to the payload; Kimi and Codex then pushed a full line
 // to ~950 B worst-case — past the old 1024's comfort zone. 1280 leaves headroom.
-#define CMD_BUF_SIZE 1280
+// Sized for the full payload: the AI limits + vitals were ~750B, and the
+// weather (~170B) and market (~410B) blocks push a full line past 1.3KB.
+#define CMD_BUF_SIZE 3072
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -376,7 +429,7 @@ void setup() {
     // The USB-CDC RX ring defaults to 256 B, so a single daemon write() of the full
     // line overran it and dropped bytes → truncated JSON ("IncompleteInput"). Enlarge
     // the ring (must be set before begin) so the whole line is buffered in one burst.
-    Serial.setRxBufferSize(2048);
+    Serial.setRxBufferSize(8192);   // one payload must land intact (see CMD_BUF_SIZE)
     Serial.begin(115200);
     delay(300);
     Serial.println("{\"ready\":true}");

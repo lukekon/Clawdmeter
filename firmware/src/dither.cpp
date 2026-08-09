@@ -291,7 +291,7 @@ void dither_sparkline(uint16_t* buf, int w, int h,
 
 void dither_lane(uint16_t* buf, int w, int h,
                  const float* vals, int n, float max_v,
-                 lv_color_t color, int cell) {
+                 lv_color_t color, int cell, float min_density) {
     dither_clear(buf, w, h);
     if (!buf || n <= 0 || w <= 0 || h <= 0) return;
     if (cell < 1) cell = 1;
@@ -318,7 +318,7 @@ void dither_lane(uint16_t* buf, int w, int h,
                 }
             continue;
         }
-        float density = clamp01(0.4f + 0.6f * (v / max_v));
+        float density = clamp01(min_density + (1.0f - min_density) * (v / max_v));
         for (int x = x0; x < x1; x++)
             for (int y = 0; y < h; y++) {
                 float t = bayer_t(x, y, cell);

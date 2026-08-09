@@ -37,7 +37,10 @@ LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
 
 // ── Views ───────────────────────────────────────────────────────────────────
-enum { PV_SYS = 0, PV_CPU, PV_GPU, PV_RAM, PV_CLAUDE, PV_CODEX, PV_KIMI, PV_GROK, PV_COUNT };
+// Machine vitals, then the four AI providers, then the two views that aren't
+// about this desk at all.
+enum { PV_SYS = 0, PV_CPU, PV_GPU, PV_RAM, PV_CLAUDE, PV_CODEX, PV_KIMI, PV_GROK,
+       PV_WEATHER, PV_MARKET, PV_COUNT };
 static int       s_view = PV_SYS;
 static lv_obj_t* s_scr  = nullptr;
 
@@ -108,6 +111,10 @@ static bool  hki()          { return s_has && s_d.valid && s_d.kimi_valid; }
 static float ki_session()   { return hki() ? s_d.kimi_session_pct : KIMI_SESSION; }
 static float ki_weekly()    { return hki() ? s_d.kimi_weekly_pct  : KIMI_WEEKLY; }
 static bool  hcd()          { return s_has && s_d.valid && s_d.codex_valid; }
+// Weather and market gate on their own blocks: both are outside the AI feed and
+// either can be absent (no network, a dead endpoint) without touching the rest.
+static bool  hwx()          { return s_has && s_d.valid && s_d.wx_valid; }
+static bool  hmk()          { return s_has && s_d.valid && s_d.mk_valid; }
 static float cd_weekly()    { return hcd() ? s_d.codex_weekly_pct : CODEX_WEEKLY; }
 
 // model display name → its identity hue (one violet family: Opus/Sonnet/Haiku/Fable
@@ -188,8 +195,8 @@ struct PaintJob {
     int         w, h, cell;
     float       f;                 // single-value forms
     lv_color_t  color;
-    float       vals[16];
-    lv_color_t  colors[16];
+    float       vals[32];      // 32, not 16: the market view's intraday spark
+    lv_color_t  colors[32];    // carries a full session at 5-minute resolution
     int         n;
     float       max_v;
     float       total;             // meter_segs total
@@ -198,6 +205,7 @@ struct PaintJob {
     int         thick;             // arc
     bool        use_bands;         // arc heat-band track
     float       live_alpha;        // spark live cell
+    float       min_density;       // PK_LANE floor for a non-zero bucket
     float       reveal_scale;      // 0..1 entrance (applied at paint time)
 };
 
@@ -257,7 +265,7 @@ static void paint_job(PaintJob* j, float reveal) {
         dither_meter(j->buf, j->w, j->h, j->f * r, j->color, j->cell);
         break;
     case PK_METER_SEGS: {
-        float vs[16];
+        float vs[32];
         for (int i = 0; i < j->n; i++) vs[i] = j->vals[i] * r;
         dither_meter_segs(j->buf, j->w, j->h, vs, j->colors, j->n, j->total, j->cell);
         break;
@@ -278,7 +286,7 @@ static void paint_job(PaintJob* j, float reveal) {
         break;
     }
     case PK_COLUMNS: {
-        float vs[16];
+        float vs[32];
         for (int i = 0; i < j->n; i++) vs[i] = j->vals[i] * r;
         dither_columns(j->buf, j->w, j->h, vs, j->colors, j->n, j->max_v, j->cell);
         break;
@@ -294,9 +302,10 @@ static void paint_job(PaintJob* j, float reveal) {
         break;
     }
     case PK_LANE: {
-        float vs[16];
+        float vs[32];
         for (int i = 0; i < j->n; i++) vs[i] = j->vals[i] * r;
-        dither_lane(j->buf, j->w, j->h, vs, j->n, j->max_v, j->color, j->cell);
+        dither_lane(j->buf, j->w, j->h, vs, j->n, j->max_v, j->color, j->cell,
+                    j->min_density);
         break;
     }
     case PK_TREEMAP: {
@@ -545,7 +554,7 @@ static void job_spark(lv_obj_t* scr, int x, int y, int w, int h,
     if (!j || !b) return;
     j->kind = PK_SPARK;
     j->buf = b; j->w = w; j->h = h; j->cell = 2;
-    j->n = n < 16 ? n : 16;
+    j->n = n < 32 ? n : 32;
     for (int i = 0; i < j->n; i++) j->vals[i] = data[i];
     j->max_v = 1.0f;
     j->color = col;
@@ -952,6 +961,149 @@ static void reset_col(lv_obj_t* scr, int mins, int cx, int y) {
     lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, y);
 }
 
+// ── Drawn marks for the weather / market views ──────────────────────────────
+// Same reasoning as draw_clock(): no bundled font carries a sun, a cloud or a
+// bolt, and baking a bitmap per condition would cost flash for something that
+// is a handful of circles and lines. Everything below rasterises into an RGB565
+// canvas over the black page, so the "background" is simply left black.
+static void disc(uint16_t* b, int D, float cx, float cy, float r, lv_color_t col) {
+    const uint16_t c = lv_color_to_u16(col);
+    const int y0 = (int)(cy - r) - 1, y1 = (int)(cy + r) + 1;
+    for (int y = y0; y <= y1; y++) {
+        for (int x = (int)(cx - r) - 1; x <= (int)(cx + r) + 1; x++) {
+            const float dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy <= r * r) px565(b, D, x, y, c);
+        }
+    }
+}
+
+static void stroke(uint16_t* b, int D, float x0, float y0, float x1, float y1,
+                   float w, lv_color_t col) {
+    const float len = sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+    const int steps = (int)(len * 2) + 1;
+    for (int i = 0; i <= steps; i++) {
+        const float t = (float)i / steps;
+        disc(b, D, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w / 2.0f, col);
+    }
+}
+
+// A cloud used by several conditions: three lobes over a flat base.
+static void draw_cloud(uint16_t* b, int D, float cx, float cy, float s, lv_color_t col) {
+    disc(b, D, cx - 0.26f * s, cy + 0.04f * s, 0.20f * s, col);
+    disc(b, D, cx + 0.02f * s, cy - 0.10f * s, 0.27f * s, col);
+    disc(b, D, cx + 0.28f * s, cy + 0.06f * s, 0.18f * s, col);
+    const uint16_t c = lv_color_to_u16(col);
+    for (int y = (int)(cy + 0.02f * s); y <= (int)(cy + 0.24f * s); y++)
+        for (int x = (int)(cx - 0.44f * s); x <= (int)(cx + 0.44f * s); x++)
+            px565(b, D, x, y, c);
+}
+
+// WMO weather code -> the glyph we draw. Grouped the way a person reads a sky,
+// not the way the code table is numbered.
+enum WxGlyph { WXG_CLEAR = 0, WXG_CLOUD, WXG_RAIN, WXG_SNOW, WXG_STORM };
+
+static WxGlyph wx_glyph(int code) {
+    if (code >= 95) return WXG_STORM;
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) return WXG_SNOW;
+    if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return WXG_RAIN;
+    if (code >= 2) return WXG_CLOUD;      // 2-3 cloudy, 45/48 fog
+    return WXG_CLEAR;                     // 0-1 clear / mainly clear
+}
+
+static void draw_weather_glyph(uint16_t* b, int D, int code, bool is_day) {
+    for (int i = 0; i < D * D; i++) b[i] = 0x0000;
+    const float S = D;
+    const float cx = D / 2.0f, cy = D / 2.0f;
+    const WxGlyph g = wx_glyph(code);
+    if (g == WXG_CLEAR) {
+        if (is_day) {
+            disc(b, D, cx, cy, 0.22f * S, PC_SUN);
+            for (int i = 0; i < 8; i++) {          // eight rays
+                const float a = i * 0.7853982f;
+                stroke(b, D, cx + cosf(a) * 0.30f * S, cy + sinf(a) * 0.30f * S,
+                       cx + cosf(a) * 0.44f * S, cy + sinf(a) * 0.44f * S, 0.05f * S, PC_SUN);
+            }
+        } else {
+            // Crescent: a disc with an offset disc punched back out in black.
+            disc(b, D, cx, cy, 0.34f * S, PC_NIGHT);
+            disc(b, D, cx + 0.16f * S, cy - 0.14f * S, 0.30f * S, lv_color_hex(0x000000));
+        }
+        return;
+    }
+    if (g == WXG_CLOUD) {
+        if (is_day) disc(b, D, cx + 0.26f * S, cy - 0.26f * S, 0.15f * S, PC_SUN);
+        draw_cloud(b, D, cx, cy - 0.04f * S, S, PC_DIM);
+        return;
+    }
+    draw_cloud(b, D, cx, cy - 0.16f * S, S, PC_DIM);
+    if (g == WXG_RAIN) {
+        for (int i = -1; i <= 1; i++)
+            stroke(b, D, cx + i * 0.22f * S + 0.04f * S, cy + 0.20f * S,
+                   cx + i * 0.22f * S - 0.04f * S, cy + 0.42f * S, 0.05f * S, PC_RAIN);
+    } else if (g == WXG_SNOW) {
+        for (int i = -1; i <= 1; i++) {           // three six-point flakes
+            const float fx = cx + i * 0.22f * S, fy = cy + 0.30f * S;
+            for (int k = 0; k < 3; k++) {
+                const float a = k * 1.0471976f;
+                stroke(b, D, fx - cosf(a) * 0.07f * S, fy - sinf(a) * 0.07f * S,
+                       fx + cosf(a) * 0.07f * S, fy + sinf(a) * 0.07f * S, 0.035f * S, PC_TEXT);
+            }
+        }
+    } else {                                       // WXG_STORM — one bolt
+        stroke(b, D, cx + 0.06f * S, cy + 0.16f * S, cx - 0.08f * S, cy + 0.32f * S,
+               0.06f * S, PC_YELLOW);
+        stroke(b, D, cx - 0.08f * S, cy + 0.32f * S, cx + 0.06f * S, cy + 0.32f * S,
+               0.06f * S, PC_YELLOW);
+        stroke(b, D, cx + 0.06f * S, cy + 0.32f * S, cx - 0.06f * S, cy + 0.48f * S,
+               0.06f * S, PC_YELLOW);
+    }
+}
+
+// Market direction mark: a solid triangle, up green / down red.
+static void draw_triangle(uint16_t* b, int D, bool up, lv_color_t col) {
+    for (int i = 0; i < D * D; i++) b[i] = 0x0000;
+    const uint16_t c = lv_color_to_u16(col);
+    const int pad = D / 8, span = D - 2 * pad;
+    for (int r = 0; r < span; r++) {
+        const float t = (float)r / (span - 1);          // 0 at the apex row
+        const int half = (int)(t * span / 2.0f);
+        const int y = up ? pad + r : D - pad - 1 - r;
+        for (int x = D / 2 - half; x <= D / 2 + half; x++) px565(b, D, x, y, c);
+    }
+}
+
+// Degree ring — a small hollow superscript circle. The bundled fonts have no
+// U+00B0 (it renders as a box), so the unit is drawn, like the clock face.
+static void degree_mark(lv_obj_t* row, lv_color_t col, int d) {
+    uint16_t* b = mkbuf(d, d);
+    if (!b) return;
+    for (int i = 0; i < d * d; i++) b[i] = 0x0000;
+    disc(b, d, d / 2.0f, d / 2.0f, d / 2.0f - 0.5f, col);
+    disc(b, d, d / 2.0f, d / 2.0f, d / 2.0f - 2.5f, lv_color_hex(0x000000));
+    lv_obj_t* cv = lv_canvas_create(row);
+    lv_canvas_set_buffer(cv, b, d, d, LV_COLOR_FORMAT_RGB565);
+}
+
+// Temperature -> the cold..hot ramp. Separate from band(): that one means LOAD,
+// and a 30°F morning is not "healthy green".
+static lv_color_t temp_color(float f) {
+    if (f >= 95.0f) return PC_HOT;
+    if (f >= 82.0f) return PC_WARM;
+    if (f >= 66.0f) return PC_MILD;
+    if (f >= 48.0f) return PC_COOL;
+    return PC_COLD;
+}
+
+static const char* wx_word(int code, bool is_day) {
+    switch (wx_glyph(code)) {
+        case WXG_STORM: return "STORMS";
+        case WXG_SNOW:  return "SNOW";
+        case WXG_RAIN:  return code >= 80 ? "SHOWERS" : "RAIN";
+        case WXG_CLOUD: return (code == 45 || code == 48) ? "FOG" : "CLOUDY";
+        default:        return is_day ? "CLEAR" : "CLEAR NIGHT";
+    }
+}
+
 // Honest no-data state, production builds only (UI_SHOT keeps the placeholder
 // constants so QA screenshots still render populated views): a provider with
 // no live reading gets this instead of invented numbers — the placeholder
@@ -1170,6 +1322,271 @@ static void view_grok(lv_obj_t* scr) {
     job_spark(scr, 32, 412, W - 64, AI_SPARK_H, grok_sk ? grok_sk : WEEK_GROK, 7, PC_GROK);
 }
 
+// WEATHER — the hero ring is the DAYLIGHT span (sunrise → sunset, filled to
+// now), so the arc, the condition word under the numeral and the sunset time in
+// the arc's open bottom are all about the same thing: the sun. Temperature is
+// the numeral because that's the question you actually walk over to ask. Below
+// it, the next 12 hours as heat-ramped columns and a rain-chance lane — the
+// shape of the rest of the day without a single axis label.
+static void view_weather(lv_obj_t* scr) {
+    chrome(scr, nullptr);
+    const int W = board_caps().width;
+    const bool day = !hwx() || s_d.wx_is_day;
+    const int code = hwx() ? s_d.wx_code : 0;
+
+    // Header mark: the drawn condition glyph, same corner and size as the AI
+    // provider marks so the views feel like one family.
+    {
+        const int D = 96;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            draw_weather_glyph(b, D, code, day);
+            canvas_at(scr, b, D, D, 14, 8);
+        }
+    }
+#ifndef UI_SHOT
+    if (!hwx()) { no_data(scr); return; }
+#endif
+
+    const int AS = AI_GAUGE_AS, ay = AI_GAUGE_Y;
+    const int ax = (W - AS) / 2, cx = ax + AS / 2;
+    const float dl = hwx() ? s_d.wx_daylight_pct : 64;
+    job_arc(scr, ax, ay, AS, dl / 100.0f, day ? PC_SUN : PC_NIGHT, 20, false);
+
+    // Temperature nested in the ring: numeral centred on the DIGITS with the
+    // drawn degree ring hanging right, the same trick pct_col plays with "%".
+    {
+        const float t = hwx() ? s_d.wx_temp : 86;
+        char n[8];
+        snprintf(n, sizeof n, "%d", (int)lroundf(t));
+        lv_obj_t* row = lv_obj_create(scr);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t* num = rtext(row, n, PC_TEXT, &font_departure_72);
+        degree_mark(row, PC_DIM, 18);
+        lv_obj_update_layout(row);
+        lv_obj_set_pos(row, cx - lv_obj_get_width(num) / 2, ay + 60);
+    }
+    brow_col(scr, wx_word(code, day), cx, ay + 150);
+    // Sunset (or sunrise before dawn) in the arc's open bottom — the slot the AI
+    // views give their reset countdown.
+    {
+        const bool before_dawn = hwx() && s_d.wx_daylight_pct <= 0 && day;
+        const char* when = hwx() ? (before_dawn ? s_d.wx_sunrise : s_d.wx_sunset) : "7:56";
+        lv_obj_t* row = crow(scr, ay + 184, 10);
+        // Half sun sitting ABOVE a horizon rule, with a clear gap between them
+        // and three rays. The first cut had the dome touching the line at 26px,
+        // which merged into an anonymous grey blob.
+        const int D = 32;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            for (int i = 0; i < D * D; i++) b[i] = 0x0000;
+            const uint16_t c = lv_color_to_u16(PC_DIM);
+            const float dome_y = D * 0.60f, r = D * 0.26f;
+            disc(b, D, D / 2.0f, dome_y, r, PC_DIM);
+            for (int y = (int)dome_y; y < D; y++)                       // keep the top half
+                for (int x = 0; x < D; x++) px565(b, D, x, y, 0x0000);
+            for (int i = -1; i <= 1; i++)                               // three rays
+                stroke(b, D, D / 2.0f + i * r * 1.15f, dome_y - r * (i ? 1.20f : 1.55f),
+                       D / 2.0f + i * r * 1.45f, dome_y - r * (i ? 1.55f : 2.00f),
+                       2.0f, PC_DIM);
+            for (int x = 0; x < D; x++) {                               // horizon, below a gap
+                px565(b, D, x, (int)dome_y + 4, c);
+                px565(b, D, x, (int)dome_y + 5, c);
+            }
+            lv_obj_t* cv = lv_canvas_create(row);
+            lv_canvas_set_buffer(cv, b, D, D, LV_COLOR_FORMAT_RGB565);
+        }
+        rtext(row, when, PC_DIM, &font_departure_32);
+    }
+
+    // Footer, on the AI views' rhythm: one value row, then two dithered forms.
+    {
+        char n[8];
+        snprintf(n, sizeof n, "%d", (int)lroundf(hwx() ? s_d.wx_feels : 95));
+        lv_obj_t* row = crow(scr, 300, 12);
+        lv_obj_t* lbl = rtext(row, "FEELS", PC_DIM, &font_styrene_24);
+        lv_obj_set_style_text_letter_space(lbl, 3, 0);
+        rtext(row, n, PC_TEXT, &font_departure_48);
+        degree_mark(row, PC_DIM, 14);
+    }
+
+    // Next 12 hours: temperature as columns (each on the cold→hot ramp) with the
+    // rain chance as a lane beneath, so "when does it cool off / when does it
+    // rain" is one glance and no axis.
+    {
+        static const float MOCK_T[12] = {86,86,87,85,84,81,78,76,74,73,71,70};
+        static const float MOCK_P[12] = {3,5,5,2,0,0,0,0,0,0,0,0};
+        const bool live = hwx() && s_d.wx_nhours > 0;
+        const int n = live ? s_d.wx_nhours : 12;
+        const float* temps = live ? s_d.wx_hourly : MOCK_T;
+        const float* rain  = live ? s_d.wx_precip : MOCK_P;
+        // Scale the columns across the day's own range, not from absolute zero:
+        // a 70→87 spread is invisible on a 0→87 axis.
+        float lo = temps[0], hi = temps[0];
+        for (int i = 0; i < n; i++) { if (temps[i] < lo) lo = temps[i]; if (temps[i] > hi) hi = temps[i]; }
+        const float span = (hi - lo) < 1.0f ? 1.0f : (hi - lo);
+
+        const int cw = W - 64, ch = 56;
+        uint16_t* b = mkbuf(cw, ch);
+        PaintJob* j = add_job();
+        if (j && b) {
+            j->kind = PK_COLUMNS;
+            j->buf = b; j->w = cw; j->h = ch; j->cell = 2;
+            j->n = n > 12 ? 12 : n;
+            j->max_v = 1.0f;
+            for (int i = 0; i < j->n; i++) {
+                j->vals[i] = 0.28f + 0.72f * (temps[i] - lo) / span;  // floor so a
+                j->colors[i] = temp_color(temps[i]);                  // cool hour
+            }                                                          // still reads
+            j->canvas = canvas_at(scr, b, cw, ch, 32, 352);
+            paint_job(j, 0);
+        }
+        uint16_t* lb = mkbuf(cw, 16);
+        PaintJob* lj = add_job();
+        if (lj && lb) {
+            lj->kind = PK_LANE;
+            lj->buf = lb; lj->w = cw; lj->h = 16; lj->cell = 2;
+            lj->n = n > 12 ? 12 : n;
+            lj->max_v = 100.0f;
+            for (int i = 0; i < lj->n; i++) lj->vals[i] = rain[i];
+            lj->color = PC_RAIN;
+            lj->min_density = 0.06f;   // 3% rain must read as almost nothing
+            lj->canvas = canvas_at(scr, lb, cw, 16, 32, 414);
+            paint_job(lj, 0);
+        }
+    }
+}
+
+// MARKET — no ring here: a market is a shape over time, and the Dither Kit's
+// sparkline (the form the AI views only ever use two centimetres tall) finally
+// gets to be the hero. The three indexes sit above it as equals rather than one
+// hero index, and the movers are Luke's own book, ranked by percent.
+//
+// The absolute index LEVEL is deliberately absent: on a 38mm panel "7,757.64"
+// costs the width of the whole screen to say something you don't act on. What
+// you act on is the move.
+static void view_market(lv_obj_t* scr) {
+    chrome(scr, nullptr);
+    const int W = board_caps().width;
+    const float lead = (hmk() && s_d.mk_nix > 0) ? s_d.mk_ix_pct[0] : 0.62f;
+
+    // Header mark: direction of the lead index, drawn as a solid triangle.
+    {
+        const int D = 84;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            draw_triangle(b, D, lead >= 0, lead >= 0 ? PC_UP : PC_DOWN);
+            canvas_at(scr, b, D, D, 20, 12);
+        }
+    }
+#ifndef UI_SHOT
+    if (!hmk()) { no_data(scr); return; }
+#endif
+    // Session state, top-right — dead space on every other view.
+    if (hmk() && s_d.mk_status[0]) {
+        char s[24];
+        char d[8];
+        fmt_dur(d, sizeof d, s_d.mk_countdown_mins);
+        snprintf(s, sizeof s, "%s  %s", s_d.mk_status,
+                 strcmp(s_d.mk_status, "OPEN") == 0 ? d : d);
+        lv_obj_t* t = lv_label_create(scr);
+        lv_label_set_text(t, s);
+        lv_obj_set_style_text_font(t, &font_styrene_24, 0);
+        lv_obj_set_style_text_color(t, PC_DIM, 0);
+        lv_obj_set_style_text_letter_space(t, 3, 0);
+        lv_obj_update_layout(t);
+        lv_obj_set_pos(t, W - 28 - lv_obj_get_width(t), 26);
+    }
+
+    // Three indexes as equals: name, then today's move at hero size.
+    {
+        static const char* MOCK_N[3] = {"S&P", "NDX", "RUT"};
+        static const float MOCK_C[3] = {0.62f, 1.30f, 1.10f};
+        const bool live = hmk() && s_d.mk_nix > 0;
+        const int n = live ? s_d.mk_nix : 3;
+        // Thirds of the screen, not (i+1)/(n+1): at 120/240/360 the three
+        // numbers run into each other. Departure Mono is ~32px per glyph at
+        // dep_48, so "+0.6" is 128px and only just clears its neighbours —
+        // which is why the unit is a SEPARATE styrene_24 glyph hanging off the
+        // right (14px) instead of a fifth mono glyph (another 32px, overflow).
+        for (int i = 0; i < n && i < 3; i++) {
+            const int cx = W * (2 * i + 1) / 6;
+            const float pct = live ? s_d.mk_ix_pct[i] : MOCK_C[i];
+            brow_col(scr, live ? s_d.mk_ix_name[i] : MOCK_N[i], cx, 118);
+            char v[12];
+            snprintf(v, sizeof v, "%+.1f", pct);
+            lv_obj_t* row = lv_obj_create(scr);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+            lv_obj_set_style_pad_column(row, 3, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_48);
+            rtext(row, "%", PC_DIM, &font_styrene_24);
+            lv_obj_update_layout(row);
+            // Centre the GROUP, not the numeral: centring the digits would push
+            // the rightmost "%" past the screen edge.
+            lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, 150);
+        }
+    }
+
+    // Lead index intraday. The prior close rides the SAME scale (the daemon
+    // normalises them together), so "above the line" means "up on the day" —
+    // draw it as a hairline over the series.
+    {
+        static const float MOCK_S[16] = {0.35f,0.42f,0.38f,0.55f,0.61f,0.58f,0.72f,0.68f,
+                                         0.75f,0.83f,0.79f,0.88f,0.84f,0.91f,0.95f,0.93f};
+        const bool live = hmk() && s_d.mk_nspark > 1;
+        const int n = live ? s_d.mk_nspark : 16;
+        const int sx = 32, sy = 216, sw = W - 64, sh = 96;
+        job_spark(scr, sx, sy, sw, sh, live ? s_d.mk_spark : MOCK_S, n,
+                  lead >= 0 ? PC_UP : PC_DOWN);
+        const float base = live ? s_d.mk_baseline : 0.30f;
+        lv_obj_t* line = lv_obj_create(scr);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_size(line, sw, 2);
+        lv_obj_set_style_bg_color(line, PC_GREY, 0);   // PC_HAIR vanishes over the dither
+        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+        int by = sy + (int)((1.0f - (base < 0 ? 0 : base > 1 ? 1 : base)) * (sh - 2));
+        lv_obj_set_pos(line, sx, by);
+    }
+
+    // Luke's movers. Symbol over percent, three columns — same grammar as the
+    // index row above so the eye reads them as "and inside that, these".
+    {
+        static const char* MOCK_S[3] = {"SPCX", "NLR", "TOL"};
+        static const float MOCK_P[3] = {15.83f, 3.47f, -2.48f};
+        const bool live = hmk() && s_d.mk_nmv > 0;
+        const int n = live ? s_d.mk_nmv : 3;
+        eyebrow_c(scr, "TOP MOVERS", PC_DIM, &font_styrene_24, 344);
+        for (int i = 0; i < n && i < 3; i++) {
+            const int cx = W * (2 * i + 1) / 6;
+            const float pct = live ? s_d.mk_mv_pct[i] : MOCK_P[i];
+            brow_col(scr, live ? s_d.mk_mv_sym[i] : MOCK_S[i], cx, 384);
+            char v[12];
+            snprintf(v, sizeof v, "%+.1f", pct);
+            lv_obj_t* row = lv_obj_create(scr);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+            lv_obj_set_style_pad_column(row, 2, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_32);
+            rtext(row, "%", PC_DIM, &font_styrene_20);
+            lv_obj_update_layout(row);
+            lv_obj_set_pos(row, cx - lv_obj_get_width(row) / 2, 412);
+        }
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 // Rebuild the current view. intro=true plays the entrance sweep (fresh view);
@@ -1197,6 +1614,8 @@ static void render_view(lv_obj_t* scr, bool intro) {
         case PV_CODEX:  view_codex(scr);  break;
         case PV_KIMI:   view_kimi(scr);   break;
         case PV_GROK:   view_grok(scr);   break;
+        case PV_WEATHER: view_weather(scr); break;
+        case PV_MARKET:  view_market(scr);  break;
         default:        view_sys(scr);    break;
     }
     start_motion(intro);

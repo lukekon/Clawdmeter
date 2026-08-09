@@ -1098,6 +1098,262 @@ class AuthError(Exception):
     must NOT be mislabeled as a token problem (SC#5: a boot-time `getaddrinfo
     failed` DNS blip wrongly fired the 'token expired' toast)."""
 
+# --- Weather (open-meteo) ---------------------------------------------------
+# No key, no auth, no account — one GET covers current conditions, the next 12
+# hours, and today's sunrise/sunset. Cached WEATHER_RECOMPUTE_S; a failure
+# returns {} so the view honestly shows no data rather than stale conditions.
+# Location is Luke's (Old Lyme, CT 06371); override in the config file with
+#   weather_lat = 41.3159
+#   weather_lon = -72.3345
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_LAT, WEATHER_LON = 41.3159, -72.3345   # 06371
+WEATHER_RECOMPUTE_S = 600
+WEATHER_HOURS = 12
+_weather_cache: dict = {"ts": 0.0, "data": {}}
+
+
+def _config_float(key: str, default: float) -> float:
+    """Read a float option from the config file; `default` on anything odd."""
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip().lower() == key:
+                    return float(v.strip())
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def _hhmm(iso: str) -> str:
+    """'2026-08-09T19:56' -> '7:56' (12-hour, no am/pm — the arc says which)."""
+    try:
+        h, m = iso.split("T")[1].split(":")[:2]
+        h12 = int(h) % 12 or 12
+        return f"{h12}:{m}"
+    except (IndexError, ValueError):
+        return ""
+
+
+def _daylight_pct(now: float, sunrise: str, sunset: str) -> int:
+    """How far through the daylight span we are, 0-100 (clamped at both ends).
+
+    Drives the weather view's hero arc, so it must be honest before dawn and
+    after dusk rather than wrapping around.
+    """
+    try:
+        rise = datetime.datetime.fromisoformat(sunrise).timestamp()
+        set_ = datetime.datetime.fromisoformat(sunset).timestamp()
+    except (ValueError, OSError, OverflowError):
+        return 0
+    if set_ <= rise:
+        return 0
+    return max(0, min(100, int(round((now - rise) / (set_ - rise) * 100))))
+
+
+async def fetch_weather() -> dict:
+    """Current conditions + the next 12 hours under "wx". {} on any failure."""
+    now = time.time()
+    if now - _weather_cache["ts"] < WEATHER_RECOMPUTE_S:
+        return dict(_weather_cache["data"])
+    lat = _config_float("weather_lat", WEATHER_LAT)
+    lon = _config_float("weather_lon", WEATHER_LON)
+    params = {
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,apparent_temperature,weather_code,"
+                   "relative_humidity_2m,wind_speed_10m,is_day",
+        "hourly": "temperature_2m,precipitation_probability",
+        "daily": "sunrise,sunset,temperature_2m_max,temperature_2m_min",
+        "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+        "timezone": "auto", "forecast_days": 2,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(WEATHER_URL, params=params)
+        if resp.status_code != 200:
+            log(f"weather HTTP {resp.status_code}")
+            return dict(_weather_cache["data"])   # hold last-good over a blip
+        j = resp.json()
+        cur, daily, hourly = j["current"], j["daily"], j["hourly"]
+        # The hourly arrays start at midnight LOCAL today; find the current hour
+        # and take the next WEATHER_HOURS from there.
+        stamp = cur["time"][:13]          # 'YYYY-MM-DDTHH'
+        i = next((k for k, t in enumerate(hourly["time"]) if t[:13] == stamp), 0)
+        window = slice(i, i + WEATHER_HOURS)
+        sunrise, sunset = daily["sunrise"][0], daily["sunset"][0]
+        wx = {
+            "t": round(cur["temperature_2m"]),
+            "f": round(cur["apparent_temperature"]),
+            "c": int(cur["weather_code"]),
+            "d": int(cur["is_day"]),
+            "h": round(cur["relative_humidity_2m"]),
+            "w": round(cur["wind_speed_10m"]),
+            "hi": round(daily["temperature_2m_max"][0]),
+            "lo": round(daily["temperature_2m_min"][0]),
+            "sr": _hhmm(sunrise), "ss": _hhmm(sunset),
+            "dp": _daylight_pct(now, sunrise, sunset),
+            "hr": [round(v) for v in hourly["temperature_2m"][window]],
+            "pp": [round(v or 0) for v in hourly["precipitation_probability"][window]],
+        }
+    except Exception as e:
+        log(f"weather fetch failed: {e}")
+        return dict(_weather_cache["data"])
+    _weather_cache.update(ts=now, data={"wx": wx})
+    return {"wx": wx}
+
+
+# --- Market (Yahoo chart/spark) ---------------------------------------------
+# The spark endpoint batches every symbol into ONE request and returns, per
+# symbol, the previous close, the live price and the intraday close series —
+# exactly what the view needs. It is UNDOCUMENTED, so a failure returns {} and
+# the view shows NO LIVE DATA rather than yesterday's prices dressed as today's.
+#
+# Luke's holdings roster comes from Monarch (end-of-day, so it prices nothing —
+# it only says WHICH tickers he owns and how big each is). It changes rarely, so
+# it lives in a sidecar written by tools/refresh_holdings.py rather than being
+# re-fetched here. Only the top MARKET_TOP_N by value are priced: the long tail
+# is sub-$2k and can't move the needle, and every extra symbol is more load on
+# an endpoint nobody promised us.
+MARKET_URL = "https://query1.finance.yahoo.com/v7/finance/spark"
+MARKET_HEADERS = {"User-Agent": "Mozilla/5.0"}
+MARKET_INDEXES = [("^GSPC", "S&P"), ("^IXIC", "NDX"), ("^RUT", "RUT")]
+MARKET_TOP_N = 25
+# Measured, not documented: the endpoint 400s at 21+ symbols in one call
+# (20 is fine, 21 is not, and it is a cap rather than a bad ticker — the
+# rejected tail returns 200 on its own). So the roster is sent in chunks.
+MARKET_CHUNK = 20
+MARKET_SPARK_POINTS = 32
+MARKET_RECOMPUTE_S = 60
+_HOLDINGS_SIDECAR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+                     / "Clawdmeter" / "holdings.json")
+_market_cache: dict = {"ts": 0.0, "data": {}}
+
+
+def read_holdings() -> list[str]:
+    """Tickers to price, biggest position first. [] if the roster was never seeded."""
+    try:
+        saved = json.loads(_HOLDINGS_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = [r for r in saved.get("holdings", []) if r.get("ticker")]
+    rows.sort(key=lambda r: -(r.get("value") or 0))
+    return [r["ticker"] for r in rows[:MARKET_TOP_N]]
+
+
+def _market_status(period: dict, now: float) -> tuple[str, int]:
+    """('OPEN'|'CLOSED', minutes to the close / to the next open) from Yahoo's
+    currentTradingPeriod. Pre/post are folded into CLOSED: the view is about the
+    regular session, and a thin pre-market print is not a market being open."""
+    try:
+        reg = period["regular"]
+        start, end = float(reg["start"]), float(reg["end"])
+    except (KeyError, TypeError, ValueError):
+        return "", -1
+    if start <= now < end:
+        return "OPEN", int((end - now) // 60)
+    # Next open: today's start if we're before it, else roughly the next weekday.
+    nxt = start if now < start else start + 86400
+    while True:
+        wd = datetime.datetime.fromtimestamp(nxt).weekday()
+        if wd < 5:
+            break
+        nxt += 86400
+    return "CLOSED", int(max(0, nxt - now) // 60)
+
+
+def _norm_series(series: list[float], baseline: float) -> tuple[list[float], float]:
+    """Scale an intraday series to 0..1 over its own min/max INCLUDING the prior
+    close, and return where that prior close sits in the same scale.
+
+    Normalising by max alone (what norm7 does for the $ sparks) would squash a
+    7700->7760 index day into a flat line at 0.99. The baseline has to share the
+    scale or the "above/below yesterday" read is a lie.
+    """
+    pts = [v for v in series if v is not None]
+    if not pts:
+        return [], 0.5
+    lo, hi = min(pts + [baseline]), max(pts + [baseline])
+    span = hi - lo
+    if span <= 0:
+        return [0.5] * len(pts), 0.5
+    step = max(1, len(pts) / MARKET_SPARK_POINTS)
+    out = [round((pts[min(int(k * step), len(pts) - 1)] - lo) / span, 3)
+           for k in range(min(MARKET_SPARK_POINTS, len(pts)))]
+    return out, round((baseline - lo) / span, 3)
+
+
+async def fetch_market() -> dict:
+    """Indexes, an intraday series for the hero, and today's top movers, as "mk".
+
+    One batched request covers the three indexes plus the priced holdings.
+    {} on any failure (undocumented endpoint — never show stale prices).
+    """
+    now = time.time()
+    if now - _market_cache["ts"] < MARKET_RECOMPUTE_S:
+        return dict(_market_cache["data"])
+    holdings = read_holdings()
+    symbols = [s for s, _ in MARKET_INDEXES] + holdings
+    chunks = [symbols[i:i + MARKET_CHUNK] for i in range(0, len(symbols), MARKET_CHUNK)]
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as http:
+            for chunk in chunks:
+                resp = await http.get(MARKET_URL, headers=MARKET_HEADERS,
+                                      params={"symbols": ",".join(chunk),
+                                              "range": "1d", "interval": "5m"})
+                if resp.status_code != 200:
+                    log(f"market HTTP {resp.status_code} for {len(chunk)} symbols")
+                    continue   # a bad chunk costs those movers, not the whole view
+                results.extend(resp.json()["spark"]["result"])
+    except Exception as e:
+        log(f"market fetch failed: {e}")
+        return {}
+    if not results:
+        return {}
+
+    by_symbol = {}
+    for entry in results:
+        try:
+            r = entry["response"][0]
+            meta = r["meta"]
+            prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+            price = meta.get("regularMarketPrice")
+            if not prev or price is None:
+                continue
+            closes = r.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+            by_symbol[entry["symbol"]] = {
+                "price": float(price),
+                "pct": (float(price) - float(prev)) / float(prev) * 100.0,
+                "prev": float(prev),
+                "closes": closes,
+                "period": meta.get("currentTradingPeriod") or {},
+            }
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    if not by_symbol:
+        return {}
+
+    mk: dict = {}
+    mk["ix"] = [{"s": label, "p": round(by_symbol[sym]["price"], 2),
+                 "c": round(by_symbol[sym]["pct"], 2)}
+                for sym, label in MARKET_INDEXES if sym in by_symbol]
+    hero = by_symbol.get(MARKET_INDEXES[0][0])
+    if hero:
+        mk["sp"], mk["b"] = _norm_series(hero["closes"], hero["prev"])
+        status, mins = _market_status(hero["period"], now)
+        if status:
+            mk["st"], mk["cd"] = status, mins
+    # Top 3 movers by PERCENT (Luke's call) over the priced holdings only.
+    movers = sorted((s for s in holdings if s in by_symbol),
+                    key=lambda s: -abs(by_symbol[s]["pct"]))[:3]
+    mk["mv"] = [{"s": s, "c": round(by_symbol[s]["pct"], 2)} for s in movers]
+    _market_cache.update(ts=now, data={"mk": mk})
+    return {"mk": mk}
+
+
 def read_chime_setting() -> str:
     """Read the `chime` option from the config file. One of: off|on.
 
@@ -1237,6 +1493,8 @@ async def poll_api(token: str) -> dict | None:
     payload.update(await fetch_grok_usage())  # adds "g"/"gd" iff PitCrew is up
     payload.update(await fetch_kimi_usage())  # adds "km"* iff Kimi has any signal
     payload.update(await fetch_codex_usage())  # adds "cd"* iff Codex has any signal
+    payload.update(await fetch_weather())      # adds "wx" iff open-meteo answered
+    payload.update(await fetch_market())       # adds "mk" iff the quote feed answered
     return payload
 
 
@@ -1541,6 +1799,8 @@ async def _send_local_only(ser: "serial.Serial") -> None:
         payload.update(await fetch_grok_usage())
         payload.update(await fetch_kimi_usage())
         payload.update(await fetch_codex_usage())
+        payload.update(await fetch_weather())
+        payload.update(await fetch_market())
         payload.update(read_vitals())
     except Exception as e:
         log(f"local-only payload build failed: {e}")

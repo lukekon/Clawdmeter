@@ -45,6 +45,21 @@
 #define PC_KIMI     lv_color_hex(0x1783ff)   // Moonshot Kimi blue — Kimi mark/spark
 #define PC_CODEX    lv_color_hex(0x10a37f)   // OpenAI teal — Codex mark/spark (hue
                                              // 167°, clear of PC_GREEN's ok band 145°)
+// Weather + market. Deliberately outside the AI identity set: these views are
+// not about a provider. The heat band (green/yellow/orange/red) means LOAD, so
+// temperature gets its own cold->hot ramp instead of borrowing it, and money
+// gets the one convention nobody misreads: green up, red down.
+#define PC_SUN      lv_color_hex(0xf2b134)   // daylight arc + sun glyph
+#define PC_NIGHT    lv_color_hex(0x5b6bb0)   // the same arc after sunset
+#define PC_COLD     lv_color_hex(0x4aa3df)   // <=40F end of the temperature ramp
+#define PC_COOL     lv_color_hex(0x49c6b7)   // ~55F
+#define PC_MILD     lv_color_hex(0x8fc94a)   // ~70F
+#define PC_WARM     lv_color_hex(0xf0a63a)   // ~85F
+#define PC_HOT      lv_color_hex(0xe9552a)   // >=95F
+#define PC_RAIN     lv_color_hex(0x3f7fd0)   // precipitation lane + rain strokes
+#define PC_UP       lv_color_hex(0x2fb872)   // market: up
+#define PC_DOWN     lv_color_hex(0xe4483a)   // market: down
+
 // Model chips/segments — one violet family (near Fable), spaced enough to read
 // apart. Rings no longer use these (they're heat-tiered); these are model identity.
 #define PC_OPUS     lv_color_hex(0x8b5cf6)   // vivid violet (flagship)
