@@ -7,6 +7,7 @@ later plans.
 """
 
 import asyncio
+import base64
 import calendar
 import datetime
 import json
@@ -22,6 +23,11 @@ import time
 from pathlib import Path
 
 import httpx
+
+try:  # package import when run as -m daemon..., plain when run as a script
+    from daemon import market_logos
+except ImportError:  # pragma: no cover
+    import market_logos
 import serial
 import serial.tools.list_ports
 
@@ -1581,6 +1587,55 @@ def write_payload(ser: "serial.Serial", payload: dict) -> None:
     ser.flush()
 
 
+# --- Mover brand logos over the serial link ---------------------------------
+# Out of band from the usage payload: a 24x24 RGB565A8 logo is 2.3KB of base64,
+# and the three on screen only change when the movers do. Re-sent when the set
+# changes, and every LOGO_RESEND_S regardless — the device keeps them in RAM, so
+# a reboot or a reflash must not leave it with blank rows until Luke happens to
+# have a new top three.
+LOGO_RESEND_S = 600
+_logo_state: dict = {"syms": (), "ts": 0.0}
+
+
+async def push_mover_logos(ser: "serial.Serial", payload: dict) -> None:
+    """Send the current top movers' logos to the device. Best-effort throughout:
+    a symbol we can't resolve simply has no logo, and the row still renders.
+
+    The fetch runs in a worker thread. A cache miss is an HTTP round trip, and
+    the asyncio loop is the sole owner of the serial port — it must not be
+    parked on the network while a payload is due. Only the write happens here.
+    """
+    movers = [m.get("s") for m in payload.get("mk", {}).get("mv", []) if m.get("s")][:3]
+    if not movers:
+        return
+    now = time.time()
+    syms = tuple(movers)
+    if syms == _logo_state["syms"] and now - _logo_state["ts"] < LOGO_RESEND_S:
+        return
+
+    def _load() -> list:
+        out = []
+        for sym in movers:
+            try:
+                out.append((sym, market_logos.fetch_logo(sym)))
+            except Exception as e:
+                log(f"logo {sym} failed: {e}")
+                out.append((sym, None))
+        return out
+
+    logos = await asyncio.to_thread(_load)
+    sent = 0
+    for slot, (sym, data) in enumerate(logos):
+        if not data:
+            continue
+        blob = base64.b64encode(data).decode("ascii")
+        ser.write(f"mklogo {slot} {sym} {market_logos.LOGO_PX} {blob}\n".encode())
+        ser.flush()          # a dead port raises — the main loop reopens it
+        sent += 1
+    _logo_state.update(syms=syms, ts=now)
+    log(f"Logos pushed: {sent}/{len(movers)} for {', '.join(movers)}")
+
+
 def _extract_access_token(blob: str) -> str | None:
     """Pull the accessToken out of a credentials blob.
 
@@ -1790,6 +1845,7 @@ async def _send_local_only(ser: "serial.Serial") -> None:
         return
     if payload:
         write_payload(ser, payload)   # raises on a dead port — main loop reopens
+        await push_mover_logos(ser, payload)
 
 
 async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
@@ -1832,6 +1888,7 @@ async def poll_and_send(ser: "serial.Serial", tray_state=None) -> None:
     except Exception as e:
         log(f"payload augment failed: {e}")
     write_payload(ser, payload)   # raises serial.SerialException/OSError on a dead port
+    await push_mover_logos(ser, payload)
     if tray_state:
         tray_state.set_connected(time.time())
 
@@ -1998,6 +2055,10 @@ async def main(tray_state=None) -> None:
                     continue
                 try:
                     ser = open_serial(port)
+                    # A fresh port means the device may have rebooted or been
+                    # reflashed, and the logos live only in its RAM — forget what
+                    # we think it has so the next payload re-pushes them.
+                    _logo_state.update(syms=(), ts=0.0)
                 except (serial.SerialException, OSError) as e:
                     # Port exists but is held (a flash/screenshot has it) or vanished
                     # between listing and opening — treat like "not found".

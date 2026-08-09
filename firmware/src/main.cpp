@@ -316,6 +316,8 @@ static bool process_usage_json(const char* json) {
 // to ~950 B worst-case — past the old 1024's comfort zone. 1280 leaves headroom.
 // Sized for the full payload: the AI limits + vitals were ~750B, and the
 // weather (~170B) and market (~410B) blocks push a full line past 1.3KB.
+// The `mklogo` line is the real ceiling now: a 24x24 RGB565A8 logo is 1728 B,
+// which is 2304 characters of base64 plus the command prefix.
 #define CMD_BUF_SIZE 3072
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
@@ -327,6 +329,55 @@ static int cmd_pos = 0;
 // gauge. Data freshness (12h in ui.cpp) — not link state — decides usage vs idle,
 // so the device keeps showing the last sync even while the daemon is stopped.
 static bool serial_link_ever = false;
+
+#ifdef PITCREW_PROTO
+// Decode base64 in place-ish into `out`; returns bytes written, or 0 on a bad
+// character. Hand-rolled because pulling in mbedtls' decoder for one command
+// would cost more than the twenty lines it takes.
+static size_t b64_decode(const char* in, uint8_t* out, size_t out_cap) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;                       // '=' padding and anything else
+    };
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t w = 0;
+    for (const char* p = in; *p && *p != '\n' && *p != '\r'; p++) {
+        if (*p == '=') break;
+        const int v = val(*p);
+        if (v < 0) return 0;             // malformed — drop the whole frame
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (w >= out_cap) return 0;
+            out[w++] = (uint8_t)((acc >> bits) & 0xFF);
+        }
+    }
+    return w;
+}
+
+// `mklogo <slot> <SYM> <px> <base64>`
+static void handle_mklogo(const char* args) {
+    int slot = 0, px = 0;
+    char sym[12] = {0};
+    int consumed = 0;
+    if (sscanf(args, "%d %11s %d %n", &slot, sym, &px, &consumed) < 3 || consumed <= 0) return;
+    if (px <= 0 || px > 64) return;
+    const size_t need = (size_t)px * px * 3;
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+    if (!buf) return;
+    const size_t got = b64_decode(args + consumed, buf, need);
+    if (got == need) proto_set_logo(slot, sym, px, buf, got);
+    else Serial.printf("mklogo %s: decoded %u of %u bytes\n", sym,
+                       (unsigned)got, (unsigned)need);
+    heap_caps_free(buf);                 // proto_set_logo keeps its own copy
+}
+#endif
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
@@ -406,6 +457,11 @@ static void check_serial_cmd() {
             // flip views over serial exactly like the device's physical side buttons.
             else if (strcmp(cmd_buf, "pnext") == 0) proto_cycle(1);
             else if (strcmp(cmd_buf, "pprev") == 0) proto_cycle(-1);
+            // `mklogo <slot> <SYM> <px> <base64 RGB565A8>` — a mover's brand logo.
+            // Out of band from the usage payload on purpose: the image is ~2KB of
+            // base64 and only changes when the top three change, so paying for it
+            // on the 60-second payload would be silly.
+            else if (strncmp(cmd_buf, "mklogo ", 7) == 0) handle_mklogo(cmd_buf + 7);
 #endif
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {

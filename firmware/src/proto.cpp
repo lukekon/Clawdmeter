@@ -28,6 +28,7 @@ static void proto_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint8_t* dat
 LV_FONT_DECLARE(font_departure_72);
 LV_FONT_DECLARE(font_departure_48);
 LV_FONT_DECLARE(font_departure_32);
+LV_FONT_DECLARE(font_departure_20);   // market table — a six-row list, not a hero
 // The panel is 2.16" square: 480 px over 38.8 mm ≈ 12.4 px/mm. At a desk viewing
 // distance a glanceable numeral needs ~3 mm of cap height ≈ dep_48/72; a label
 // bottoms out around styrene_24. NOTHING below styrene_20 is legible here — the
@@ -35,6 +36,7 @@ LV_FONT_DECLARE(font_departure_32);
 LV_FONT_DECLARE(font_styrene_28);
 LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
+LV_FONT_DECLARE(font_styrene_14);
 
 // ── Views ───────────────────────────────────────────────────────────────────
 // Machine vitals, then the four AI providers, then the two views that aren't
@@ -1483,15 +1485,89 @@ static void view_weather(lv_obj_t* scr) {
 // leaving ~34px clear of the header above and ~36px of the page dots below.
 enum {
     MK_LEFT    = 26,
-    MK_PRICE_R = 300,
-    MK_MOVE_R  = 454,
-    MK_TOP     = 76,                              // first index row
+    MK_LOGO    = 24,                              // mover logo box, left of the symbol
+    MK_SYM_X   = MK_LEFT + MK_LOGO + 12,          // symbols clear the logo column
+    MK_PRICE_R = 356,                             // both value columns sit hard right,
+    MK_MOVE_R  = 462,                             // leaving the name column wide.
+                                                  // 356 not 372: a six-glyph price
+                                                  // (133.11) and a six-glyph move
+                                                  // (+15.83) collide otherwise.
+    MK_TOP     = 92,                              // first index row
     MK_PITCH   = 48,                              // every row, both groups
-    MK_ROW_H   = 32,                              // dep_32 band
-    MK_RULE_Y  = MK_TOP + 2 * MK_PITCH + MK_ROW_H + 22,   // 226
-    MK_BROW_Y  = MK_RULE_Y + 14,                          // 240
-    MK_MOVE_Y  = MK_BROW_Y + 24 + 20,                     // 284 — first mover row
+    MK_ROW_H   = 20,                              // dep_20 band
+    MK_RULE_Y  = MK_TOP + 2 * MK_PITCH + MK_ROW_H + 22,   // 230
+    MK_BROW_Y  = MK_RULE_Y + 14,                          // 244
+    MK_MOVE_Y  = MK_BROW_Y + 20 + 20,                     // 284 — first mover row
 };
+
+// ── Mover brand logos ───────────────────────────────────────────────────────
+// Streamed from the daemon rather than baked into flash, because the answer to
+// "what are today's three biggest movers" is not knowable at build time — it is
+// any three of Luke's ~25 priced positions, and the roster itself changes when
+// he trades. Baking would mean a reflash every time he buys something.
+//
+// So the daemon resolves ticker -> company -> favicon (Wikidata for the domain,
+// Google's favicon service for the image), caches the result on disk, and
+// pushes the three current ones over the serial link with `mklogo` whenever the
+// set changes or the device may have rebooted. Three RGB565A8 slots live in
+// PSRAM for the life of the process — NOT registered with s_bufs, which
+// free_bufs() reclaims on every render.
+#define MK_LOGO_SLOTS 3
+struct MkLogo {
+    char     sym[12];
+    int      px;
+    uint8_t* data;      // RGB565A8: px*px*2 colour bytes then px*px alpha
+    size_t   cap;
+};
+static MkLogo s_mk_logos[MK_LOGO_SLOTS] = {};
+
+// Descriptors must outlive the draw, so they are static per slot rather than
+// stack temporaries (LVGL keeps the pointer, it does not copy the header).
+static lv_image_dsc_t* mk_logo_dsc(int px, const uint8_t* data) {
+    static lv_image_dsc_t dscs[MK_LOGO_SLOTS];
+    static int next = 0;
+    lv_image_dsc_t* d = &dscs[next];
+    next = (next + 1) % MK_LOGO_SLOTS;
+    proto_icon_dsc(d, px, px, data);
+    return d;
+}
+
+// Find the logo for a symbol, or nullptr. Matching by SYMBOL rather than slot
+// index means a reordered top-three (the common case — they shuffle all day)
+// never draws the wrong brand next to a ticker.
+static const uint8_t* mk_logo_for(const char* sym, int* px_out) {
+    for (int i = 0; i < MK_LOGO_SLOTS; i++) {
+        if (s_mk_logos[i].data && s_mk_logos[i].sym[0] &&
+            strcmp(s_mk_logos[i].sym, sym) == 0) {
+            *px_out = s_mk_logos[i].px;
+            return s_mk_logos[i].data;
+        }
+    }
+    return nullptr;
+}
+
+static void render_view(lv_obj_t* scr, bool intro);   // defined with the public API
+
+void proto_set_logo(int slot, const char* sym, int px, const uint8_t* data, size_t len) {
+    if (slot < 0 || slot >= MK_LOGO_SLOTS || !sym || px <= 0 || px > 64) return;
+    const size_t need = (size_t)px * px * 3;
+    if (!data || len != need) return;
+    MkLogo& L = s_mk_logos[slot];
+    if (L.cap < need) {
+        heap_caps_free(L.data);
+#ifdef BOARD_HAS_PSRAM
+        L.data = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM);
+#else
+        L.data = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
+        L.cap = L.data ? need : 0;
+    }
+    if (!L.data) return;
+    memcpy(L.data, data, need);
+    L.px = px;
+    strlcpy(L.sym, sym, sizeof(L.sym));
+    if (s_scr && s_view == PV_MARKET) render_view(s_scr, false);   // show it now
+}
 
 // "26690.62" -> "26,691" / "133.11" -> "133.11". Grouping is hand-rolled:
 // newlib on the ESP32 has no locale to lean on for %'d.
@@ -1508,16 +1584,29 @@ static void fmt_price(char* out, size_t n, float v) {
     out[w] = '\0';
 }
 
-// One list row: symbol, right-aligned price, right-aligned move (+ its unit).
-static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct) {
-    lv_obj_t* s = rtext(scr, sym, PC_TEXT, &font_styrene_24);
+// One list row: an optional brand logo, the symbol, then the price and today's
+// move right-aligned in their own columns. Type is deliberately small here
+// (styrene_20 / dep_20 rather than the 24/32 of the first cut) — this is a
+// six-row table you scan, not a single number you read from across the room,
+// and the smaller set buys the width the logo column needs.
+static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct,
+                   const uint8_t* logo, int logo_px) {
+    if (logo && logo_px > 0) {
+        lv_image_dsc_t* dsc = mk_logo_dsc(logo_px, logo);
+        if (dsc) {
+            lv_obj_t* img = lv_image_create(scr);
+            lv_image_set_src(img, dsc);
+            lv_obj_set_pos(img, MK_LEFT, y + (MK_ROW_H - logo_px) / 2);
+        }
+    }
+    lv_obj_t* s = rtext(scr, sym, PC_TEXT, &font_styrene_20);
     lv_obj_set_style_text_letter_space(s, 3, 0);
     lv_obj_update_layout(s);
-    lv_obj_set_pos(s, MK_LEFT, y + 6);          // optical centre against dep_32
+    lv_obj_set_pos(s, logo ? MK_SYM_X : MK_LEFT, y + 1);
 
     char p[16];
     fmt_price(p, sizeof p, price);
-    lv_obj_t* pl = rtext(scr, p, PC_DIM, &font_departure_32);
+    lv_obj_t* pl = rtext(scr, p, PC_DIM, &font_departure_20);
     lv_obj_update_layout(pl);
     lv_obj_set_pos(pl, MK_PRICE_R - lv_obj_get_width(pl), y);
 
@@ -1530,8 +1619,8 @@ static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
     lv_obj_set_style_pad_column(row, 2, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_32);
-    rtext(row, "%", PC_DIM, &font_styrene_20);
+    rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_20);
+    rtext(row, "%", PC_DIM, &font_styrene_14);
     lv_obj_update_layout(row);
     lv_obj_set_pos(row, MK_MOVE_R - lv_obj_get_width(row), y);
 }
@@ -1568,7 +1657,8 @@ static void view_market(lv_obj_t* scr) {
             mk_row(scr, MK_TOP + i * MK_PITCH,
                    live ? s_d.mk_ix_name[i] : MOCK_N[i],
                    live ? s_d.mk_ix_price[i] : MOCK_P[i],
-                   live ? s_d.mk_ix_pct[i]   : MOCK_C[i]);
+                   live ? s_d.mk_ix_pct[i]   : MOCK_C[i],
+                   nullptr, 0);
     }
 
     // Hairline + eyebrow: the movers are a different KIND of row (his book, not
@@ -1592,11 +1682,15 @@ static void view_market(lv_obj_t* scr) {
         static const float MOCK_C[3] = {15.83f, 3.47f, -2.48f};
         const bool live = hmk() && s_d.mk_nmv > 0;
         const int n = live ? s_d.mk_nmv : 3;
-        for (int i = 0; i < n && i < 3; i++)
-            mk_row(scr, MK_MOVE_Y + i * MK_PITCH,
-                   live ? s_d.mk_mv_sym[i]   : MOCK_S[i],
+        for (int i = 0; i < n && i < 3; i++) {
+            const char* sym = live ? s_d.mk_mv_sym[i] : MOCK_S[i];
+            int lpx = 0;
+            const uint8_t* logo = mk_logo_for(sym, &lpx);
+            mk_row(scr, MK_MOVE_Y + i * MK_PITCH, sym,
                    live ? s_d.mk_mv_price[i] : MOCK_P[i],
-                   live ? s_d.mk_mv_pct[i]   : MOCK_C[i]);
+                   live ? s_d.mk_mv_pct[i]   : MOCK_C[i],
+                   logo, lpx);
+        }
     }
 }
 
