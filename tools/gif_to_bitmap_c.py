@@ -13,12 +13,17 @@ scanlines -> arcs -> knot -> hold -> loop).
 
 Two rules earn their keep here:
 
-1. The crop is sized off the SETTLED KNOT, not the union of every frame.
+1. The crop is sized off the SETTLED KNOT, not the union of every frame, and
+   frames too wide for it are SCALED DOWN to fit rather than clipped.
    The build-up phase sweeps arcs wider than the finished knot, so a union
    crop left the steady-state mark filling only ~64% of the canvas - it read
-   as a small logo next to the Grok mark, which fills its box. Cropping to
-   knot_bbox / KNOT_FRAC makes the resting knot the thing that fills the
-   frame; the widest build-up frames lose a few edge pixels (reported below).
+   as a small logo next to the Grok mark, which fills its box. But a fixed
+   knot-sized crop chops the build-up's edges (Luke caught it on the device:
+   "in a brief moment of the animation, the logo is cut off on the edges").
+   So the crop is per-frame: each frame gets the smallest box that both holds
+   its own ink and is at least the knot's box, smoothed into a non-increasing
+   envelope so the mark only ever eases inward. The build-up therefore zooms
+   gently in and settles at full size, and nothing is ever cut off.
 
 2. Consecutive identical frames collapse into one entry + a hold count.
    The gif's "slow spin" tail is not a spin at all: frames 78..168 were
@@ -62,20 +67,30 @@ def main() -> None:
     start = next(i for i, b in enumerate(boxes) if b)
     raws, boxes = raws[start:], boxes[start:]
 
-    # Crop off the settled knot so IT fills the canvas (rule 1 above).
+    # The settled knot sets the target crop, centred on the knot (rule 1).
     kx0, ky0, kx1, ky1 = union(boxes[SETTLED_FROM:])
     cx, cy = (kx0 + kx1) / 2, (ky0 + ky1) / 2
-    half = max(kx1 - kx0, ky1 - ky0) / 2 / KNOT_FRAC
-    half = min(half, cx, cy, W - cx, H - cy)
-    box = (int(cx - half), int(cy - half), int(cx + half), int(cy + half))
-    print(f"settled knot {(kx0, ky0, kx1, ky1)} -> crop {box} ({box[2] - box[0]}px square)")
+    limit = min(cx, cy, W - cx, H - cy)          # can't crop past the source edge
+    knot_half = min(max(kx1 - kx0, ky1 - ky0) / 2 / KNOT_FRAC, limit)
+    print(f"settled knot {(kx0, ky0, kx1, ky1)} -> knot crop {2 * knot_half:.0f}px square")
 
-    # How much of the wider build-up phase falls outside that crop.
-    ax0, ay0, ax1, ay1 = union(boxes)
-    over = max(box[0] - ax0, box[1] - ay0, ax1 - box[2], ay1 - box[3], 0)
-    print(f"build-up overshoot: {over}px of source ({over / (box[2] - box[0]) * PX:.1f}px on canvas)")
+    # Per-frame: grow the box past this frame's ink (1.06, enough margin that
+    # LANCZOS ringing stays off the border too), then smooth into a
+    # non-increasing envelope (backwards pass) so the mark only ever eases
+    # inward and never pops outward mid-animation.
+    halves = []
+    for b in boxes:
+        need = max(cx - b[0], cy - b[1], b[2] - cx, b[3] - cy) * 1.06
+        halves.append(min(max(knot_half, need), limit))
+    for i in range(len(halves) - 2, -1, -1):
+        halves[i] = max(halves[i], halves[i + 1])
+    print(f"crop envelope {2 * halves[0]:.0f}px -> {2 * halves[-1]:.0f}px "
+          f"(build-up starts at {halves[-1] / halves[0] * 100:.0f}% scale, nothing clipped)")
 
-    grids = [list(f.crop(box).resize((PX, PX), Image.LANCZOS).getdata()) for f in raws]
+    grids = []
+    for f, h in zip(raws, halves):
+        box = (int(cx - h), int(cy - h), int(cx + h), int(cy + h))
+        grids.append(list(f.crop(box).resize((PX, PX), Image.LANCZOS).getdata()))
 
     # Collapse runs of identical frames into one entry + a hold count (rule 2).
     packed_frames, holds = [], []
