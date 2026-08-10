@@ -28,7 +28,8 @@ static void proto_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint8_t* dat
 LV_FONT_DECLARE(font_departure_72);
 LV_FONT_DECLARE(font_departure_48);
 LV_FONT_DECLARE(font_departure_32);
-LV_FONT_DECLARE(font_departure_20);   // market table — a six-row list, not a hero
+LV_FONT_DECLARE(font_departure_24);   // market table — a six-row list, not a hero
+LV_FONT_DECLARE(font_departure_20);
 // The panel is 2.16" square: 480 px over 38.8 mm ≈ 12.4 px/mm. At a desk viewing
 // distance a glanceable numeral needs ~3 mm of cap height ≈ dep_48/72; a label
 // bottoms out around styrene_24. NOTHING below styrene_20 is legible here — the
@@ -36,6 +37,7 @@ LV_FONT_DECLARE(font_departure_20);   // market table — a six-row list, not a 
 LV_FONT_DECLARE(font_styrene_28);
 LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
+LV_FONT_DECLARE(font_styrene_16);
 LV_FONT_DECLARE(font_styrene_14);
 
 // ── Views ───────────────────────────────────────────────────────────────────
@@ -1472,32 +1474,34 @@ static void view_weather(lv_obj_t* scr) {
 // biggest movers in his own book (ranked by percent, from the top 25 positions
 // by value).
 //
-// Column geometry is set by Departure Mono's ~21px glyph at dep_32: the price
-// is right-aligned at PRICE_R and the move at MOVE_R, leaving the symbol the
-// span from the left margin to PRICE_R minus the widest price. Index prices
-// drop their cents (a 7,757.64 that moves 48 points a day does not need them);
-// smaller share prices keep them.
+// Column geometry is set by Departure Mono's advance width at dep_24 — 244/16 =
+// 15.25px per glyph, every glyph, since it is a monospace: the price is
+// right-aligned at PRICE_R and the move at MOVE_R, leaving the symbol the span
+// from the left margin to PRICE_R minus the widest price. Index prices drop
+// their cents (a 7,757.64 that moves 48 points a day does not need them);
+// smaller share prices keep them, so six glyphs (91px) is the widest either
+// column ever gets and PRICE_R sits far enough left to leave a real gutter.
 //
-// Vertical rhythm is ONE pitch for all six rows — the first cut used 52 for the
-// indexes and 44 for the movers, and the mismatch was visible. Derived rather
-// than hand-placed so the two groups can't drift apart again: rows are 32px
-// tall, so the block runs from MK_TOP to MK_MOVE_Y + 2*MK_PITCH + 32 = 412,
-// leaving ~34px clear of the header above and ~36px of the page dots below.
+// Vertical rhythm is ONE pitch for all six rows — an earlier cut used 52 for the
+// indexes and 44 for the movers, and the mismatch was visible. The MOVERS group
+// is the anchor: MK_GAP absorbs any change to MK_TOP, so pulling the index block
+// up toward the header (as here) leaves the lower half exactly where it was.
 enum {
     MK_LEFT    = 26,
-    MK_LOGO    = 24,                              // mover logo box, left of the symbol
+    MK_LOGO    = 28,                              // mover logo box, left of the symbol
     MK_SYM_X   = MK_LEFT + MK_LOGO + 12,          // symbols clear the logo column
-    MK_PRICE_R = 356,                             // both value columns sit hard right,
+    MK_PRICE_R = 340,                             // both value columns sit hard right,
     MK_MOVE_R  = 462,                             // leaving the name column wide.
-                                                  // 356 not 372: a six-glyph price
-                                                  // (133.11) and a six-glyph move
+                                                  // 340, not further right: a six-glyph
+                                                  // price (133.11) and a six-glyph move
                                                   // (+15.83) collide otherwise.
-    MK_TOP     = 92,                              // first index row
+    MK_TOP     = 76,                              // first index row
     MK_PITCH   = 48,                              // every row, both groups
-    MK_ROW_H   = 20,                              // dep_20 band
-    MK_RULE_Y  = MK_TOP + 2 * MK_PITCH + MK_ROW_H + 22,   // 230
-    MK_BROW_Y  = MK_RULE_Y + 14,                          // 244
-    MK_MOVE_Y  = MK_BROW_Y + 20 + 20,                     // 284 — first mover row
+    MK_ROW_H   = 24,                              // dep_24 band
+    MK_GAP     = 34,                              // index block -> rule
+    MK_RULE_Y  = MK_TOP + 2 * MK_PITCH + MK_ROW_H + MK_GAP,   // 230
+    MK_BROW_Y  = MK_RULE_Y + 14,                              // 244
+    MK_MOVE_Y  = MK_BROW_Y + 20 + 20,                         // 284 — first mover row
 };
 
 // ── Mover brand logos ───────────────────────────────────────────────────────
@@ -1585,12 +1589,16 @@ static void fmt_price(char* out, size_t n, float v) {
 }
 
 // One list row: an optional brand logo, the symbol, then the price and today's
-// move right-aligned in their own columns. Type is deliberately small here
-// (styrene_20 / dep_20 rather than the 24/32 of the first cut) — this is a
-// six-row table you scan, not a single number you read from across the room,
-// and the smaller set buys the width the logo column needs.
+// move right-aligned in their own columns. The values carry the view, so they
+// run a size above the names (dep_24 against styrene_20) rather than matching
+// them — this is still a six-row table you scan, not a hero numeral.
+//
+// `y` is the row's text-box top for the names; the numbers sit 3px higher so the
+// two fonts share a baseline (styrene_20 is a 21px box, dep_24 a 24px one, both
+// with a 4px descent).
 static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct,
                    const uint8_t* logo, int logo_px) {
+    const int vy = y - 3;
     if (logo && logo_px > 0) {
         lv_image_dsc_t* dsc = mk_logo_dsc(logo_px, logo);
         if (dsc) {
@@ -1606,9 +1614,9 @@ static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct
 
     char p[16];
     fmt_price(p, sizeof p, price);
-    lv_obj_t* pl = rtext(scr, p, PC_DIM, &font_departure_20);
+    lv_obj_t* pl = rtext(scr, p, PC_DIM, &font_departure_24);
     lv_obj_update_layout(pl);
-    lv_obj_set_pos(pl, MK_PRICE_R - lv_obj_get_width(pl), y);
+    lv_obj_set_pos(pl, MK_PRICE_R - lv_obj_get_width(pl), vy);
 
     char v[12];
     snprintf(v, sizeof v, "%+.2f", pct);
@@ -1619,32 +1627,61 @@ static void mk_row(lv_obj_t* scr, int y, const char* sym, float price, float pct
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
     lv_obj_set_style_pad_column(row, 2, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_20);
-    rtext(row, "%", PC_DIM, &font_styrene_14);
+    rtext(row, v, pct >= 0 ? PC_UP : PC_DOWN, &font_departure_24);
+    rtext(row, "%", PC_DIM, &font_styrene_16);
     lv_obj_update_layout(row);
-    lv_obj_set_pos(row, MK_MOVE_R - lv_obj_get_width(row), y);
+    lv_obj_set_pos(row, MK_MOVE_R - lv_obj_get_width(row), vy);
+}
+
+// Section heads, double-struck. Styrene ships one weight in this build, so bold
+// is faked the way a renderer fakes it when a family has no bold cut: draw the
+// word twice, a pixel apart. At 4bpp the overlap composites to a solid stem and
+// both edges keep their antialiasing.
+static void mk_head(lv_obj_t* scr, const char* t, int x, int y, int ls) {
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t* l = rtext(scr, t, PC_DIM, &font_styrene_24);
+        lv_obj_set_style_text_letter_space(l, ls, 0);
+        lv_obj_set_pos(l, x + i, y);
+    }
 }
 
 static void view_market(lv_obj_t* scr) {
-    chrome(scr, "MARKET");
+    chrome(scr, nullptr);                       // the head below is drawn bold
+    mk_head(scr, "MARKET", 28, 18, 4);
     const int W = board_caps().width;
 #ifndef UI_SHOT
     if (!hmk()) { no_data(scr); return; }
 #endif
-    // Session state, top-right. Phrased as the NEXT event, not the current one:
-    // "CLOSED 18H" read as "closed for 18 hours" when it meant "opens in 18"
-    // (Luke, on a Sunday afternoon 48 hours into a weekend). "OPENS IN 18H"
-    // can only be read one way, and it still says the market is shut.
+    // Session state, top-right: a clock and a duration, no words. The words went
+    // through two rounds — "CLOSED 18H" read as "closed FOR 18 hours" when it
+    // meant "opens in 18", and "OPENS IN" then ate the width — so the clock now
+    // carries "time until the session flips" the same way it does on the AI
+    // views. WHICH way it flips is the colour: green while the market is trading
+    // and counting down to the close, dim while it is shut.
     if (hmk() && s_d.mk_status[0]) {
         const bool open = strcmp(s_d.mk_status, "OPEN") == 0;
+        const lv_color_t col = open ? PC_UP : PC_DIM;
         char d[8];
         fmt_dur(d, sizeof d, s_d.mk_countdown_mins);
-        char msg[24];
-        snprintf(msg, sizeof msg, "%s IN %s", open ? "CLOSES" : "OPENS", d);
-        lv_obj_t* t = rtext(scr, msg, PC_DIM, &font_styrene_24);
+        lv_obj_t* row = lv_obj_create(scr);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        const int D = 22;
+        uint16_t* b = mkbuf(D, D);
+        if (b) {
+            draw_clock(b, D, col);
+            lv_obj_t* cv = lv_canvas_create(row);
+            lv_canvas_set_buffer(cv, b, D, D, LV_COLOR_FORMAT_RGB565);
+        }
+        lv_obj_t* t = rtext(row, d, col, &font_styrene_24);
         lv_obj_set_style_text_letter_space(t, 3, 0);
-        lv_obj_update_layout(t);
-        lv_obj_set_pos(t, W - 26 - lv_obj_get_width(t), 18);
+        lv_obj_update_layout(row);
+        lv_obj_set_pos(row, W - 26 - lv_obj_get_width(row), 18);
     }
 
     {
@@ -1671,9 +1708,7 @@ static void view_market(lv_obj_t* scr) {
         lv_obj_set_style_bg_opa(hr, LV_OPA_COVER, 0);
         lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_pos(hr, MK_LEFT, MK_RULE_Y);
-        lv_obj_t* e = rtext(scr, "TOP MOVERS", PC_DIM, &font_styrene_24);
-        lv_obj_set_style_text_letter_space(e, 3, 0);
-        lv_obj_set_pos(e, MK_LEFT, MK_BROW_Y);
+        mk_head(scr, "TOP MOVERS", MK_LEFT, MK_BROW_Y, 3);
     }
 
     {

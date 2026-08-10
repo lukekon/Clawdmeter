@@ -316,9 +316,9 @@ static bool process_usage_json(const char* json) {
 // to ~950 B worst-case — past the old 1024's comfort zone. 1280 leaves headroom.
 // Sized for the full payload: the AI limits + vitals were ~750B, and the
 // weather (~170B) and market (~410B) blocks push a full line past 1.3KB.
-// The `mklogo` line is the real ceiling now: a 24x24 RGB565A8 logo is 1728 B,
-// which is 2304 characters of base64 plus the command prefix.
-#define CMD_BUF_SIZE 3072
+// The `mklogo` line is the real ceiling now: a 28x28 RGB565A8 logo is 2352 B,
+// which is 3136 characters of base64 plus the command prefix.
+#define CMD_BUF_SIZE 4096
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 

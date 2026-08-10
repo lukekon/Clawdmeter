@@ -255,6 +255,14 @@ lv_font_conv --font assets/DejaVuSansMono.ttf \
   -r 0x20-0x7E,0xB7,0x2026,0x2722,0x2733,0x2736,0x273B,0x273D \
   --size 32 --format lvgl --bpp 4 --no-compress \
   -o firmware/src/font_mono_32.c --lv-include "lvgl.h"
+
+# Departure Mono (every numeric readout in the proto UI; 20/24/32/48/72)
+# The source is NOT in assets/ — it's OFL, grab a release from
+# github.com/rektdeckard/departure-mono and point --font at the .otf.
+# The range carries the degree, middot and em dash the views draw as marks.
+lv_font_conv --font DepartureMono-Regular.otf -r 0x20-0x7E,0xB0,0xB7,0x2014 \
+  --size 24 --format lvgl --bpp 4 --no-compress \
+  -o firmware/src/font_departure_24.c --lv-include "lvgl.h"
 ```
 
 **Important:** `lv_font_conv` v1.5.3 outputs LVGL 8 format. Each generated file must be patched for LVGL 9 compatibility:

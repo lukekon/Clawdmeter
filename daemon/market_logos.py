@@ -15,7 +15,7 @@ Resolution, all free and key-less:
                               handful of lookups in a row.
   website -> icon             Google's favicon service. Favicons are designed
                               to survive being tiny, which is exactly the job
-                              at 24px; a full logotype would be a smear.
+                              at 28px; a full logotype would be a smear.
 
 Everything is cached on disk under %LOCALAPPDATA%\\Clawdmeter\\logos, keyed by
 ticker, so a symbol costs two HTTP calls once and nothing ever again. A ticker
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import httpx
 
-LOGO_PX = 24
+LOGO_PX = 28
 CACHE_DIR = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
              / "Clawdmeter" / "logos")
 WIKIDATA_URL = "https://query.wikidata.org/sparql"
